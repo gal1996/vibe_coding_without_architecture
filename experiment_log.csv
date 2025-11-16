@@ -1,0 +1,3 @@
+Task_ID,Group,Description,T_exec,Q_dev_Warnings,Q_dev_Coverage,T_maint,LOC_churn,Defects,S_under
+TASK_001,No-Arch,サンプルタスク: ユーザー認証機能の実装,45,3,85,,,,,
+TASK_002,With-Arch,サンプルタスク: ユーザー認証機能の実装,60,0,92,,,,,
