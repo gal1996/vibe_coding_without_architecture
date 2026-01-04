@@ -130,4 +130,51 @@ echo "12. 更新後の商品一覧（在庫が減っているはず）"
 curl -s "$BASE_URL/products" | jq '.'
 echo ""
 
+echo "===== 決済処理テスト ====="
+echo "13. 決済シミュレーション（90%の確率で成功）"
+echo "   複数回注文を試みて、決済の成功/失敗を確認"
+echo ""
+
+# 新しいユーザーを作成（決済テスト用）
+echo "   決済テスト用の新規ユーザーを作成..."
+PAYMENT_USER_RESPONSE=$(curl -s -X POST "$BASE_URL/register" \
+  -H "Content-Type: application/json" \
+  -d '{"username": "paymenttest_'$(date +%s)'", "password": "test123"}')
+PAYMENT_TOKEN=$(echo "$PAYMENT_USER_RESPONSE" | jq -r '.token')
+
+# 5回試行して決済の成功・失敗パターンを確認
+for i in {1..5}; do
+  echo ""
+  echo "   試行 $i:"
+  ORDER_PAYMENT_TEST=$(curl -s -X POST "$BASE_URL/orders" \
+    -H "Content-Type: application/json" \
+    -H "Authorization: Bearer $PAYMENT_TOKEN" \
+    -d '{
+      "items": [
+        {"product_id": 2, "quantity": 1}
+      ]
+    }')
+
+  # レスポンスの確認
+  if echo "$ORDER_PAYMENT_TEST" | jq -e '.status == "completed"' > /dev/null 2>&1; then
+    TRANSACTION_ID=$(echo "$ORDER_PAYMENT_TEST" | jq -r '.transaction_id')
+    TOTAL=$(echo "$ORDER_PAYMENT_TEST" | jq -r '.total_price')
+    echo "     ✅ 決済成功"
+    echo "        Transaction ID: $TRANSACTION_ID"
+    echo "        Total Price: ${TOTAL}円"
+    echo "        Status: completed"
+  elif echo "$ORDER_PAYMENT_TEST" | jq -e '.error' > /dev/null 2>&1; then
+    ERROR_MSG=$(echo "$ORDER_PAYMENT_TEST" | jq -r '.error')
+    echo "     ❌ 決済失敗"
+    echo "        Error: $ERROR_MSG"
+    echo "        Status: payment_failed"
+  else
+    echo "     ⚠️ 予期しないレスポンス:"
+    echo "$ORDER_PAYMENT_TEST" | jq '.'
+  fi
+
+  sleep 0.5  # サーバーに負荷をかけないため少し待つ
+done
+
+echo ""
 echo "===== テスト完了 ====="

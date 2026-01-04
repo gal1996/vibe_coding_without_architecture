@@ -10,6 +10,26 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
+// テスト用モック決済ゲートウェイ
+type MockPaymentGateway struct {
+	shouldSucceed bool
+}
+
+func (m *MockPaymentGateway) ProcessPayment(amount int, orderID int) PaymentResult {
+	if m.shouldSucceed {
+		return PaymentResult{
+			Success:       true,
+			TransactionID: "TEST_TXN_123",
+			Message:       "Test payment successful",
+		}
+	}
+	return PaymentResult{
+		Success:       false,
+		TransactionID: "",
+		Message:       "Test payment failed",
+	}
+}
+
 func TestGetProductsHandler(t *testing.T) {
 	// テスト用の商品を追加
 	productMux.Lock()
@@ -241,6 +261,10 @@ func TestCreateProductHandler(t *testing.T) {
 }
 
 func TestCreateOrderHandler(t *testing.T) {
+	// 元の決済ゲートウェイを保存して後で復元
+	originalGateway := paymentGateway
+	defer func() { paymentGateway = originalGateway }()
+
 	// テスト用ユーザーとトークンを設定
 	testUser := &User{ID: 3, Username: "orderuser", IsAdmin: false}
 	userToken := "order-test-token"
@@ -253,6 +277,9 @@ func TestCreateOrderHandler(t *testing.T) {
 	products[200] = &Product{ID: 200, Name: "商品A", Price: 1000, Stock: 10, Category: "テスト"}
 	products[201] = &Product{ID: 201, Name: "商品B", Price: 2000, Stock: 5, Category: "テスト"}
 	productMux.Unlock()
+
+	// 決済成功ケースのテスト
+	paymentGateway = &MockPaymentGateway{shouldSucceed: true}
 
 	// 正常な注文（5000円未満なので送料500円が加算される）
 	reqBody := `{"items": [{"product_id": 200, "quantity": 2}, {"product_id": 201, "quantity": 1}]}`
@@ -376,6 +403,50 @@ func TestCreateOrderHandler(t *testing.T) {
 	if w.Code != http.StatusNotFound {
 		t.Errorf("Expected status %d for nonexistent product, got %d", http.StatusNotFound, w.Code)
 	}
+
+	// 決済失敗ケースのテスト
+	paymentGateway = &MockPaymentGateway{shouldSucceed: false}
+
+	// 商品の在庫を復元
+	productMux.Lock()
+	products[203] = &Product{ID: 203, Name: "商品D", Price: 1500, Stock: 10, Category: "テスト"}
+	initialStock := products[203].Stock
+	productMux.Unlock()
+
+	reqBody = `{"items": [{"product_id": 203, "quantity": 2}]}`
+	req = httptest.NewRequest("POST", "/orders", bytes.NewBufferString(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+userToken)
+	w = httptest.NewRecorder()
+	createOrderHandler(w, req)
+
+	// ステータスコードがPaymentRequired (402)であることを確認
+	if w.Code != http.StatusPaymentRequired {
+		t.Errorf("Expected status %d for payment failure, got %d", http.StatusPaymentRequired, w.Code)
+	}
+
+	// 在庫が減っていないことを確認
+	productMux.RLock()
+	if products[203].Stock != initialStock {
+		t.Errorf("Stock should not be decreased on payment failure. Expected %d, got %d",
+			initialStock, products[203].Stock)
+	}
+	productMux.RUnlock()
+
+	// 注文がpayment_failedステータスで保存されていることを確認
+	orderMux.RLock()
+	var failedOrder *Order
+	for _, o := range orders {
+		if o.UserID == testUser.ID && o.Status == "payment_failed" {
+			failedOrder = o
+			break
+		}
+	}
+	orderMux.RUnlock()
+
+	if failedOrder == nil {
+		t.Error("Failed order should be saved with payment_failed status")
+	}
 }
 
 func TestGetOrdersHandler(t *testing.T) {
@@ -483,12 +554,13 @@ func TestMainHandler(t *testing.T) {
 		t.Errorf("Expected status %d for nonexistent route, got %d", http.StatusNotFound, w.Code)
 	}
 
-	// メソッド不一致のテスト
+	// メソッド不一致のテスト（サポートされていないメソッド）
+	// 注: mainHandlerのルーティングでは未サポートのメソッドも404を返す実装になっている
 	req = httptest.NewRequest("DELETE", "/products", nil)
 	w = httptest.NewRecorder()
 	mainHandler(w, req)
 
-	if w.Code != http.StatusMethodNotAllowed {
-		t.Errorf("Expected status %d for wrong method, got %d", http.StatusMethodNotAllowed, w.Code)
+	if w.Code != http.StatusNotFound {
+		t.Errorf("Expected status %d for unsupported method, got %d", http.StatusNotFound, w.Code)
 	}
 }

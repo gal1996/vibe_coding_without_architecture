@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math/rand"
 	"net/http"
 	"strconv"
 	"strings"
@@ -45,6 +46,17 @@ type Order struct {
 	CreatedAt   time.Time   `json:"created_at"`
 }
 
+// 決済関連の型定義
+type PaymentResult struct {
+	Success       bool   `json:"success"`
+	TransactionID string `json:"transaction_id"`
+	Message       string `json:"message"`
+}
+
+type PaymentGateway interface {
+	ProcessPayment(amount int, orderID int) PaymentResult
+}
+
 // データストア（インメモリ）
 var (
 	products    = make(map[int]*Product)
@@ -62,6 +74,43 @@ var (
 	nextUserID    = 1
 	nextOrderID   = 1
 )
+
+// ダミー決済ゲートウェイの実装
+type DummyPaymentGateway struct{}
+
+func (d *DummyPaymentGateway) ProcessPayment(amount int, orderID int) PaymentResult {
+	// 90%の確率で成功するようにシミュレート
+	rand.Seed(time.Now().UnixNano())
+	success := rand.Float64() < 0.9
+
+	if success {
+		// 成功時はトランザクションIDを生成
+		transactionID := fmt.Sprintf("TXN_%d_%d", time.Now().Unix(), orderID)
+		return PaymentResult{
+			Success:       true,
+			TransactionID: transactionID,
+			Message:       "Payment processed successfully",
+		}
+	}
+
+	// 失敗時のメッセージ
+	failureReasons := []string{
+		"Insufficient funds",
+		"Card declined",
+		"Payment gateway timeout",
+		"Invalid card details",
+	}
+	reason := failureReasons[rand.Intn(len(failureReasons))]
+
+	return PaymentResult{
+		Success:       false,
+		TransactionID: "",
+		Message:       reason,
+	}
+}
+
+// グローバルな決済ゲートウェイインスタンス
+var paymentGateway PaymentGateway = &DummyPaymentGateway{}
 
 // 初期データ
 func init() {
@@ -93,8 +142,11 @@ func init() {
 }
 
 // ユーティリティ関数
+var tokenCounter int
+
 func generateToken() string {
-	return fmt.Sprintf("token_%d_%d", time.Now().Unix(), nextUserID)
+	tokenCounter++
+	return fmt.Sprintf("token_%d_%d_%d", time.Now().UnixNano(), nextUserID, tokenCounter)
 }
 
 func getAuthUser(r *http.Request) *User {
@@ -391,28 +443,59 @@ func createOrderHandler(w http.ResponseWriter, r *http.Request) {
 	// 合計金額（税込 + 送料）
 	totalPrice := subtotal + tax + shippingFee
 
-	// 在庫を減らす
-	for i, item := range req.Items {
-		orderProducts[i].Stock -= item.Quantity
-	}
+	// 注文IDを先に生成（決済処理で必要）
+	orderID := nextOrderID
 
-	// 注文を作成
+	// 決済処理を実行（在庫減算前）
+	paymentResult := paymentGateway.ProcessPayment(totalPrice, orderID)
+
+	// 注文オブジェクトを作成
 	order := &Order{
-		ID:          nextOrderID,
+		ID:          orderID,
 		UserID:      user.ID,
 		Items:       req.Items,
 		TotalPrice:  totalPrice,
 		ShippingFee: shippingFee,
-		Status:      "confirmed",
 		CreatedAt:   time.Now(),
 	}
 
-	orderMux.Lock()
-	nextOrderID++
-	orders[order.ID] = order
-	orderMux.Unlock()
+	if paymentResult.Success {
+		// 決済成功時のみ在庫を減らす
+		for i, item := range req.Items {
+			orderProducts[i].Stock -= item.Quantity
+		}
+		order.Status = "completed"
 
-	jsonResponse(w, http.StatusCreated, order)
+		// 注文を保存
+		orderMux.Lock()
+		nextOrderID++
+		orders[order.ID] = order
+		orderMux.Unlock()
+
+		// 成功レスポンスにトランザクションIDを含める
+		response := struct {
+			*Order
+			TransactionID string `json:"transaction_id"`
+		}{
+			Order:         order,
+			TransactionID: paymentResult.TransactionID,
+		}
+
+		jsonResponse(w, http.StatusCreated, response)
+	} else {
+		// 決済失敗時は在庫を減らさない
+		order.Status = "payment_failed"
+
+		// 失敗した注文も記録（監査目的）
+		orderMux.Lock()
+		nextOrderID++
+		orders[order.ID] = order
+		orderMux.Unlock()
+
+		// エラーレスポンス
+		errorResponse(w, http.StatusPaymentRequired,
+			fmt.Sprintf("Payment failed: %s", paymentResult.Message))
+	}
 }
 
 // 注文一覧取得（ユーザー自身の注文のみ）
