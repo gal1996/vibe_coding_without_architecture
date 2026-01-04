@@ -37,10 +37,14 @@ func TestGetProductsHandler(t *testing.T) {
 		ID:       100,
 		Name:     "テスト商品",
 		Price:    1000,
-		Stock:    10,
 		Category: "テスト",
 	}
 	productMux.Unlock()
+
+	// テスト用の在庫を追加
+	stockMux.Lock()
+	stocks["100-1"] = &Stock{ProductID: 100, WarehouseID: 1, Quantity: 10}
+	stockMux.Unlock()
 
 	// 全商品取得のテスト
 	req := httptest.NewRequest("GET", "/products", nil)
@@ -51,7 +55,7 @@ func TestGetProductsHandler(t *testing.T) {
 		t.Errorf("Expected status %d, got %d", http.StatusOK, w.Code)
 	}
 
-	var result []Product
+	var result []ProductDetailResponse
 	json.NewDecoder(w.Body).Decode(&result)
 	if len(result) == 0 {
 		t.Error("Expected products, got empty array")
@@ -69,13 +73,13 @@ func TestGetProductsHandler(t *testing.T) {
 	json.NewDecoder(w.Body).Decode(&result)
 	found := false
 	for _, p := range result {
-		if p.Category == "テスト" {
+		if p.Category == "テスト" && p.TotalStock == 10 {
 			found = true
 			break
 		}
 	}
 	if !found {
-		t.Error("Category filter not working")
+		t.Error("Category filter not working or stock not calculated correctly")
 	}
 }
 
@@ -89,10 +93,13 @@ func TestGetProductHandler(t *testing.T) {
 		t.Errorf("Expected status %d, got %d", http.StatusOK, w.Code)
 	}
 
-	var product Product
+	var product ProductDetailResponse
 	json.NewDecoder(w.Body).Decode(&product)
 	if product.ID != 1 {
 		t.Errorf("Expected product ID 1, got %d", product.ID)
+	}
+	if product.TotalStock == 0 {
+		t.Error("Expected stock information, got none")
 	}
 
 	// 存在しない商品のテスト
@@ -215,7 +222,7 @@ func TestCreateProductHandler(t *testing.T) {
 	sessionMux.Unlock()
 
 	// 管理者による商品作成
-	reqBody := `{"name": "新商品", "price": 5000, "stock": 15, "category": "テスト"}`
+	reqBody := `{"name": "新商品", "price": 5000, "initial_stock": 15, "category": "テスト"}`
 	req := httptest.NewRequest("POST", "/products", bytes.NewBufferString(reqBody))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+adminToken)
@@ -248,7 +255,7 @@ func TestCreateProductHandler(t *testing.T) {
 	}
 
 	// 不正なデータでの商品作成
-	reqBody = `{"name": "", "price": -1, "stock": -1, "category": ""}`
+	reqBody = `{"name": "", "price": -1, "initial_stock": -1, "category": ""}`
 	req = httptest.NewRequest("POST", "/products", bytes.NewBufferString(reqBody))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+adminToken)
@@ -274,9 +281,15 @@ func TestCreateOrderHandler(t *testing.T) {
 
 	// テスト用商品を追加
 	productMux.Lock()
-	products[200] = &Product{ID: 200, Name: "商品A", Price: 1000, Stock: 10, Category: "テスト"}
-	products[201] = &Product{ID: 201, Name: "商品B", Price: 2000, Stock: 5, Category: "テスト"}
+	products[200] = &Product{ID: 200, Name: "商品A", Price: 1000, Category: "テスト"}
+	products[201] = &Product{ID: 201, Name: "商品B", Price: 2000, Category: "テスト"}
 	productMux.Unlock()
+
+	// テスト用在庫を追加
+	stockMux.Lock()
+	stocks["200-1"] = &Stock{ProductID: 200, WarehouseID: 1, Quantity: 10}
+	stocks["201-1"] = &Stock{ProductID: 201, WarehouseID: 1, Quantity: 5}
+	stockMux.Unlock()
 
 	// 決済成功ケースのテスト
 	paymentGateway = &MockPaymentGateway{shouldSucceed: true}
@@ -308,19 +321,22 @@ func TestCreateOrderHandler(t *testing.T) {
 	}
 
 	// 在庫確認
-	productMux.RLock()
-	if products[200].Stock != 8 {
-		t.Errorf("Expected stock 8 for product 200, got %d", products[200].Stock)
+	stockMux.RLock()
+	if stocks["200-1"].Quantity != 8 {
+		t.Errorf("Expected stock 8 for product 200 in warehouse 1, got %d", stocks["200-1"].Quantity)
 	}
-	if products[201].Stock != 4 {
-		t.Errorf("Expected stock 4 for product 201, got %d", products[201].Stock)
+	if stocks["201-1"].Quantity != 4 {
+		t.Errorf("Expected stock 4 for product 201 in warehouse 1, got %d", stocks["201-1"].Quantity)
 	}
-	productMux.RUnlock()
+	stockMux.RUnlock()
 
 	// 送料無料のケース（5000円以上）
 	productMux.Lock()
-	products[202] = &Product{ID: 202, Name: "商品C", Price: 3000, Stock: 10, Category: "テスト"}
+	products[202] = &Product{ID: 202, Name: "商品C", Price: 3000, Category: "テスト"}
 	productMux.Unlock()
+	stockMux.Lock()
+	stocks["202-1"] = &Stock{ProductID: 202, WarehouseID: 1, Quantity: 10}
+	stockMux.Unlock()
 
 	reqBody = `{"items": [{"product_id": 202, "quantity": 2}]}`
 	req = httptest.NewRequest("POST", "/orders", bytes.NewBufferString(reqBody))
@@ -409,9 +425,12 @@ func TestCreateOrderHandler(t *testing.T) {
 
 	// 商品の在庫を復元
 	productMux.Lock()
-	products[203] = &Product{ID: 203, Name: "商品D", Price: 1500, Stock: 10, Category: "テスト"}
-	initialStock := products[203].Stock
+	products[203] = &Product{ID: 203, Name: "商品D", Price: 1500, Category: "テスト"}
 	productMux.Unlock()
+	stockMux.Lock()
+	stocks["203-1"] = &Stock{ProductID: 203, WarehouseID: 1, Quantity: 10}
+	initialStock := stocks["203-1"].Quantity
+	stockMux.Unlock()
 
 	reqBody = `{"items": [{"product_id": 203, "quantity": 2}]}`
 	req = httptest.NewRequest("POST", "/orders", bytes.NewBufferString(reqBody))
@@ -426,12 +445,12 @@ func TestCreateOrderHandler(t *testing.T) {
 	}
 
 	// 在庫が減っていないことを確認
-	productMux.RLock()
-	if products[203].Stock != initialStock {
+	stockMux.RLock()
+	if stocks["203-1"].Quantity != initialStock {
 		t.Errorf("Stock should not be decreased on payment failure. Expected %d, got %d",
-			initialStock, products[203].Stock)
+			initialStock, stocks["203-1"].Quantity)
 	}
-	productMux.RUnlock()
+	stockMux.RUnlock()
 
 	// 注文がpayment_failedステータスで保存されていることを確認
 	orderMux.RLock()
