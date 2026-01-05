@@ -110,6 +110,29 @@ type PromotionAnalysis struct {
 	CouponUsageRate float64 `json:"coupon_usage_rate"` // パーセンテージ（0-100）
 }
 
+// お気に入り関連の型定義
+type Wishlist struct {
+	UserID    int `json:"user_id"`
+	ProductID int `json:"product_id"`
+}
+
+type ProductDetailResponseWithFavorite struct {
+	ID          int              `json:"id"`
+	Name        string           `json:"name"`
+	Price       int              `json:"price"`
+	Category    string           `json:"category"`
+	TotalStock  int              `json:"total_stock"`
+	StockDetail []StockWarehouse `json:"stock_detail"`
+	IsFavorite  bool             `json:"is_favorite"`
+}
+
+type RecommendedProduct struct {
+	ID       int    `json:"id"`
+	Name     string `json:"name"`
+	Price    int    `json:"price"`
+	Category string `json:"category"`
+}
+
 // 決済関連の型定義
 type PaymentResult struct {
 	Success       bool   `json:"success"`
@@ -131,6 +154,7 @@ var (
 	orders      = make(map[int]*Order)
 	sessions    = make(map[string]*User)
 	coupons     = make(map[string]*Coupon)
+	wishlists   = make(map[string]*Wishlist) // key: "userID-productID"
 
 	productMux   sync.RWMutex
 	warehouseMux sync.RWMutex
@@ -139,6 +163,7 @@ var (
 	orderMux     sync.RWMutex
 	sessionMux   sync.RWMutex
 	couponMux    sync.RWMutex
+	wishlistMux  sync.RWMutex
 
 	nextProductID   = 1
 	nextWarehouseID = 1
@@ -512,6 +537,104 @@ func generateSalesReport() *SalesReportResponse {
 	return report
 }
 
+// お気に入り関連のヘルパー関数
+func isProductInWishlist(userID int, productID int) bool {
+	key := fmt.Sprintf("%d-%d", userID, productID)
+	wishlistMux.RLock()
+	defer wishlistMux.RUnlock()
+	_, exists := wishlists[key]
+	return exists
+}
+
+func addToWishlist(userID int, productID int) bool {
+	key := fmt.Sprintf("%d-%d", userID, productID)
+	wishlistMux.Lock()
+	defer wishlistMux.Unlock()
+
+	if _, exists := wishlists[key]; exists {
+		return false // 既に登録済み
+	}
+
+	wishlists[key] = &Wishlist{
+		UserID:    userID,
+		ProductID: productID,
+	}
+	return true
+}
+
+func removeFromWishlist(userID int, productID int) bool {
+	key := fmt.Sprintf("%d-%d", userID, productID)
+	wishlistMux.Lock()
+	defer wishlistMux.Unlock()
+
+	if _, exists := wishlists[key]; !exists {
+		return false // 存在しない
+	}
+
+	delete(wishlists, key)
+	return true
+}
+
+func getUserWishlistCategories(userID int) map[string]bool {
+	categories := make(map[string]bool)
+	wishlistMux.RLock()
+	defer wishlistMux.RUnlock()
+
+	for _, wishlist := range wishlists {
+		// wishlists キーの形式を確認し、ユーザーIDが一致するものを選択
+		if wishlist != nil && wishlist.UserID == userID {
+			productMux.RLock()
+			if product, exists := products[wishlist.ProductID]; exists {
+				categories[product.Category] = true
+			}
+			productMux.RUnlock()
+		}
+	}
+	return categories
+}
+
+func getRecommendations(userID int) []RecommendedProduct {
+	// ユーザーのお気に入りカテゴリを取得
+	favoriteCategories := getUserWishlistCategories(userID)
+	if len(favoriteCategories) == 0 {
+		return []RecommendedProduct{}
+	}
+
+	// ユーザーのお気に入り商品IDを取得
+	wishlistMux.RLock()
+	userFavorites := make(map[int]bool)
+	for _, wishlist := range wishlists {
+		// キーの形式を確認し、ユーザーIDが一致するものを選択
+		if wishlist != nil && wishlist.UserID == userID {
+			userFavorites[wishlist.ProductID] = true
+		}
+	}
+	wishlistMux.RUnlock()
+
+	// おすすめ商品を選定
+	recommendations := []RecommendedProduct{}
+	productMux.RLock()
+	defer productMux.RUnlock()
+
+	for _, product := range products {
+		// カテゴリが一致し、まだお気に入りでない商品を選定
+		if favoriteCategories[product.Category] && !userFavorites[product.ID] {
+			recommendations = append(recommendations, RecommendedProduct{
+				ID:       product.ID,
+				Name:     product.Name,
+				Price:    product.Price,
+				Category: product.Category,
+			})
+			// 最大3件まで
+			if len(recommendations) >= 3 {
+				break
+			}
+		}
+	}
+
+	return recommendations
+}
+
 // ハンドラー関数
 
 // 商品一覧取得（カテゴリフィルタ対応）
@@ -523,20 +646,32 @@ func getProductsHandler(w http.ResponseWriter, r *http.Request) {
 
 	category := r.URL.Query().Get("category")
 
+	// 認証ユーザーを取得
+	user := getAuthUser(r)
+	var userID int
+	if user != nil {
+		userID = user.ID
+	}
+
 	productMux.RLock()
 	defer productMux.RUnlock()
 
-	var result []ProductDetailResponse
+	var result []ProductDetailResponseWithFavorite
 	for _, p := range products {
 		if category == "" || p.Category == category {
 			totalStock, stockDetails := getProductStock(p.ID)
-			result = append(result, ProductDetailResponse{
+			isFavorite := false
+			if user != nil {
+				isFavorite = isProductInWishlist(userID, p.ID)
+			}
+			result = append(result, ProductDetailResponseWithFavorite{
 				ID:          p.ID,
 				Name:        p.Name,
 				Price:       p.Price,
 				Category:    p.Category,
 				TotalStock:  totalStock,
 				StockDetail: stockDetails,
+				IsFavorite:  isFavorite,
 			})
 		}
 	}
@@ -573,16 +708,24 @@ func getProductHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 認証ユーザーを取得
+	user := getAuthUser(r)
+	isFavorite := false
+	if user != nil {
+		isFavorite = isProductInWishlist(user.ID, product.ID)
+	}
+
 	// 倉庫別在庫情報を取得
 	totalStock, stockDetails := getProductStock(product.ID)
 
-	response := ProductDetailResponse{
+	response := ProductDetailResponseWithFavorite{
 		ID:          product.ID,
 		Name:        product.Name,
 		Price:       product.Price,
 		Category:    product.Category,
 		TotalStock:  totalStock,
 		StockDetail: stockDetails,
+		IsFavorite:  isFavorite,
 	}
 
 	jsonResponse(w, http.StatusOK, response)
@@ -990,6 +1133,111 @@ func getSalesReportHandler(w http.ResponseWriter, r *http.Request) {
 	jsonResponse(w, http.StatusOK, report)
 }
 
+// お気に入り追加ハンドラー
+func addToWishlistHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		errorResponse(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+
+	// 認証確認
+	user := getAuthUser(r)
+	if user == nil {
+		errorResponse(w, http.StatusUnauthorized, "Unauthorized")
+		return
+	}
+
+	// URLから商品IDを取得
+	parts := strings.Split(r.URL.Path, "/")
+	if len(parts) < 3 {
+		errorResponse(w, http.StatusBadRequest, "Invalid product ID")
+		return
+	}
+
+	productID, err := strconv.Atoi(parts[2])
+	if err != nil {
+		errorResponse(w, http.StatusBadRequest, "Invalid product ID")
+		return
+	}
+
+	// 商品の存在確認
+	productMux.RLock()
+	product := products[productID]
+	productMux.RUnlock()
+
+	if product == nil {
+		errorResponse(w, http.StatusNotFound, "Product not found")
+		return
+	}
+
+	// お気に入りに追加
+	if addToWishlist(user.ID, productID) {
+		jsonResponse(w, http.StatusCreated, map[string]interface{}{
+			"message":    "Added to wishlist",
+			"product_id": productID,
+		})
+	} else {
+		errorResponse(w, http.StatusConflict, "Product already in wishlist")
+	}
+}
+
+// お気に入り削除ハンドラー
+func removeFromWishlistHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "DELETE" {
+		errorResponse(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+
+	// 認証確認
+	user := getAuthUser(r)
+	if user == nil {
+		errorResponse(w, http.StatusUnauthorized, "Unauthorized")
+		return
+	}
+
+	// URLから商品IDを取得
+	parts := strings.Split(r.URL.Path, "/")
+	if len(parts) < 3 {
+		errorResponse(w, http.StatusBadRequest, "Invalid product ID")
+		return
+	}
+
+	productID, err := strconv.Atoi(parts[2])
+	if err != nil {
+		errorResponse(w, http.StatusBadRequest, "Invalid product ID")
+		return
+	}
+
+	// お気に入りから削除
+	if removeFromWishlist(user.ID, productID) {
+		jsonResponse(w, http.StatusOK, map[string]interface{}{
+			"message":    "Removed from wishlist",
+			"product_id": productID,
+		})
+	} else {
+		errorResponse(w, http.StatusNotFound, "Product not in wishlist")
+	}
+}
+
+// おすすめ商品取得ハンドラー
+func getRecommendationsHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		errorResponse(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+
+	// 認証確認
+	user := getAuthUser(r)
+	if user == nil {
+		errorResponse(w, http.StatusUnauthorized, "Unauthorized")
+		return
+	}
+
+	// おすすめ商品を取得
+	recommendations := getRecommendations(user.ID)
+	jsonResponse(w, http.StatusOK, recommendations)
+}
+
 // メインハンドラー
 func mainHandler(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
@@ -1012,6 +1260,12 @@ func mainHandler(w http.ResponseWriter, r *http.Request) {
 		getOrdersHandler(w, r)
 	case path == "/admin/reports/sales" && r.Method == "GET":
 		getSalesReportHandler(w, r)
+	case strings.HasPrefix(path, "/wishlist/") && r.Method == "POST":
+		addToWishlistHandler(w, r)
+	case strings.HasPrefix(path, "/wishlist/") && r.Method == "DELETE":
+		removeFromWishlistHandler(w, r)
+	case path == "/users/me/recommendations" && r.Method == "GET":
+		getRecommendationsHandler(w, r)
 	default:
 		errorResponse(w, http.StatusNotFound, "Not found")
 	}
@@ -1022,14 +1276,17 @@ func main() {
 
 	fmt.Printf("Starting EC Backend API server on port %s\n", port)
 	fmt.Println("\nAvailable endpoints:")
-	fmt.Println("  GET    /products              - List all products (filter: ?category=xxx)")
-	fmt.Println("  GET    /products/{id}         - Get product details")
-	fmt.Println("  POST   /products              - Create product (admin only)")
-	fmt.Println("  POST   /register              - Register new user")
-	fmt.Println("  POST   /login                 - Login")
-	fmt.Println("  POST   /orders                - Create order (auth required)")
-	fmt.Println("  GET    /orders                - Get user's orders (auth required)")
-	fmt.Println("  GET    /admin/reports/sales   - Sales analysis report (admin only)")
+	fmt.Println("  GET    /products                  - List all products (filter: ?category=xxx)")
+	fmt.Println("  GET    /products/{id}             - Get product details")
+	fmt.Println("  POST   /products                  - Create product (admin only)")
+	fmt.Println("  POST   /register                  - Register new user")
+	fmt.Println("  POST   /login                     - Login")
+	fmt.Println("  POST   /orders                    - Create order (auth required)")
+	fmt.Println("  GET    /orders                    - Get user's orders (auth required)")
+	fmt.Println("  GET    /admin/reports/sales       - Sales analysis report (admin only)")
+	fmt.Println("  POST   /wishlist/{product_id}     - Add product to wishlist (auth required)")
+	fmt.Println("  DELETE /wishlist/{product_id}     - Remove product from wishlist (auth required)")
+	fmt.Println("  GET    /users/me/recommendations  - Get personalized recommendations (auth required)")
 	fmt.Println("\nDefault admin credentials: username=admin, password=admin123")
 
 	http.HandleFunc("/", mainHandler)

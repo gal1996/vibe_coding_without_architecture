@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"golang.org/x/crypto/bcrypt"
@@ -1047,6 +1048,303 @@ func TestSalesReportHandler(t *testing.T) {
 		orders = tempOrders
 		orderMux.Unlock()
 	})
+}
+
+func TestWishlistOperations(t *testing.T) {
+	// テスト用ユーザーとトークンを設定
+	testUser := &User{ID: 50, Username: "wishlistuser", IsAdmin: false}
+	userToken := "wishlist-test-token"
+	sessionMux.Lock()
+	sessions[userToken] = testUser
+	sessionMux.Unlock()
+
+	// テスト用商品を追加（専用カテゴリを使用）
+	productMux.Lock()
+	products[500] = &Product{ID: 500, Name: "ウィッシュリスト商品A", Price: 5000, Category: "ウィッシュリストテスト"}
+	products[501] = &Product{ID: 501, Name: "ウィッシュリスト商品B", Price: 10000, Category: "ウィッシュリストテスト"}
+	products[502] = &Product{ID: 502, Name: "ウィッシュリスト商品C", Price: 3000, Category: "別カテゴリ"}
+	productMux.Unlock()
+
+	// テスト用在庫を追加
+	stockMux.Lock()
+	stocks["500-1"] = &Stock{ProductID: 500, WarehouseID: 1, Quantity: 10}
+	stocks["501-1"] = &Stock{ProductID: 501, WarehouseID: 1, Quantity: 5}
+	stocks["502-1"] = &Stock{ProductID: 502, WarehouseID: 1, Quantity: 8}
+	stockMux.Unlock()
+
+	// お気に入り追加のテスト
+	t.Run("AddToWishlist", func(t *testing.T) {
+		req := httptest.NewRequest("POST", "/wishlist/500", nil)
+		req.Header.Set("Authorization", "Bearer "+userToken)
+		w := httptest.NewRecorder()
+		addToWishlistHandler(w, req)
+
+		if w.Code != http.StatusCreated {
+			t.Errorf("Expected status %d, got %d", http.StatusCreated, w.Code)
+		}
+
+		var response map[string]interface{}
+		json.NewDecoder(w.Body).Decode(&response)
+		if response["message"] != "Added to wishlist" {
+			t.Errorf("Expected message 'Added to wishlist', got %v", response["message"])
+		}
+		if int(response["product_id"].(float64)) != 500 {
+			t.Errorf("Expected product_id 500, got %v", response["product_id"])
+		}
+
+		// 実際にウィッシュリストに追加されているか確認
+		if !isProductInWishlist(testUser.ID, 500) {
+			t.Error("Product should be in wishlist")
+		}
+	})
+
+	// 重複追加のテスト
+	t.Run("AddDuplicateToWishlist", func(t *testing.T) {
+		req := httptest.NewRequest("POST", "/wishlist/500", nil)
+		req.Header.Set("Authorization", "Bearer "+userToken)
+		w := httptest.NewRecorder()
+		addToWishlistHandler(w, req)
+
+		if w.Code != http.StatusConflict {
+			t.Errorf("Expected status %d for duplicate, got %d", http.StatusConflict, w.Code)
+		}
+	})
+
+	// 存在しない商品の追加テスト
+	t.Run("AddNonexistentProductToWishlist", func(t *testing.T) {
+		req := httptest.NewRequest("POST", "/wishlist/999999", nil)
+		req.Header.Set("Authorization", "Bearer "+userToken)
+		w := httptest.NewRecorder()
+		addToWishlistHandler(w, req)
+
+		if w.Code != http.StatusNotFound {
+			t.Errorf("Expected status %d for nonexistent product, got %d", http.StatusNotFound, w.Code)
+		}
+	})
+
+	// 認証なしでの追加テスト
+	t.Run("AddToWishlistWithoutAuth", func(t *testing.T) {
+		req := httptest.NewRequest("POST", "/wishlist/501", nil)
+		w := httptest.NewRecorder()
+		addToWishlistHandler(w, req)
+
+		if w.Code != http.StatusUnauthorized {
+			t.Errorf("Expected status %d for no auth, got %d", http.StatusUnauthorized, w.Code)
+		}
+	})
+
+	// 商品一覧でis_favoriteフィールドの確認
+	t.Run("ProductListWithFavorite", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/products?category=ウィッシュリストテスト", nil)
+		req.Header.Set("Authorization", "Bearer "+userToken)
+		w := httptest.NewRecorder()
+		getProductsHandler(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Errorf("Expected status %d, got %d", http.StatusOK, w.Code)
+		}
+
+		var products []ProductDetailResponseWithFavorite
+		json.NewDecoder(w.Body).Decode(&products)
+
+		foundFavorite := false
+		foundNonFavorite := false
+		for _, p := range products {
+			if p.ID == 500 && p.IsFavorite {
+				foundFavorite = true
+			}
+			if p.ID == 501 && !p.IsFavorite {
+				foundNonFavorite = true
+			}
+		}
+		if !foundFavorite {
+			t.Error("Product 500 should be marked as favorite")
+		}
+		if !foundNonFavorite {
+			t.Error("Product 501 should not be marked as favorite")
+		}
+	})
+
+	// 商品詳細でis_favoriteフィールドの確認
+	t.Run("ProductDetailWithFavorite", func(t *testing.T) {
+		// お気に入りに登録済みの商品
+		req := httptest.NewRequest("GET", "/products/500", nil)
+		req.Header.Set("Authorization", "Bearer "+userToken)
+		w := httptest.NewRecorder()
+		getProductHandler(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Errorf("Expected status %d, got %d", http.StatusOK, w.Code)
+		}
+
+		var product ProductDetailResponseWithFavorite
+		json.NewDecoder(w.Body).Decode(&product)
+		if !product.IsFavorite {
+			t.Error("Product 500 should be marked as favorite")
+		}
+
+		// お気に入りに未登録の商品
+		req = httptest.NewRequest("GET", "/products/501", nil)
+		req.Header.Set("Authorization", "Bearer "+userToken)
+		w = httptest.NewRecorder()
+		getProductHandler(w, req)
+
+		json.NewDecoder(w.Body).Decode(&product)
+		if product.IsFavorite {
+			t.Error("Product 501 should not be marked as favorite")
+		}
+	})
+
+	// おすすめ商品取得（お気に入りに追加してから）
+	t.Run("GetRecommendations", func(t *testing.T) {
+		// まず商品500をお気に入りに追加
+		req := httptest.NewRequest("POST", "/wishlist/500", nil)
+		req.Header.Set("Authorization", "Bearer "+userToken)
+		w := httptest.NewRecorder()
+		addToWishlistHandler(w, req)
+
+		if w.Code != http.StatusCreated && w.Code != http.StatusConflict {
+			t.Fatalf("Failed to add product to wishlist: status %d", w.Code)
+		}
+
+		// デバッグ：現在のwishlistの状態を確認
+		wishlistMux.RLock()
+		wishlistCount := 0
+		for key, wishlist := range wishlists {
+			if wishlist != nil && wishlist.UserID == testUser.ID {
+				t.Logf("Wishlist item found: key=%s, UserID=%d, ProductID=%d", key, wishlist.UserID, wishlist.ProductID)
+				wishlistCount++
+			}
+		}
+		t.Logf("Total wishlist items for user %d: %d", testUser.ID, wishlistCount)
+		wishlistMux.RUnlock()
+
+		// 同じカテゴリの商品501もお気に入りにない状態でおすすめされるはず
+		req = httptest.NewRequest("GET", "/users/me/recommendations", nil)
+		req.Header.Set("Authorization", "Bearer "+userToken)
+		w = httptest.NewRecorder()
+		getRecommendationsHandler(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Errorf("Expected status %d, got %d", http.StatusOK, w.Code)
+		}
+
+		var recommendations []RecommendedProduct
+		json.NewDecoder(w.Body).Decode(&recommendations)
+
+		// デバッグ情報を出力
+		t.Logf("Number of recommendations: %d", len(recommendations))
+		for i, r := range recommendations {
+			t.Logf("Recommendation %d: ID=%d, Name=%s, Category=%s", i, r.ID, r.Name, r.Category)
+		}
+
+		foundRecommendation := false
+		for _, r := range recommendations {
+			if r.ID == 501 && r.Category == "ウィッシュリストテスト" {
+				foundRecommendation = true
+				break
+			}
+		}
+		if !foundRecommendation {
+			t.Error("Product 501 should be recommended (same category as favorite)")
+		}
+
+		// 別カテゴリの商品502は推薦されないはず
+		for _, r := range recommendations {
+			if r.ID == 502 {
+				t.Error("Product 502 should not be recommended (different category)")
+			}
+		}
+	})
+
+	// おすすめ商品取得（認証なし）
+	t.Run("GetRecommendationsWithoutAuth", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/users/me/recommendations", nil)
+		w := httptest.NewRecorder()
+		getRecommendationsHandler(w, req)
+
+		if w.Code != http.StatusUnauthorized {
+			t.Errorf("Expected status %d for no auth, got %d", http.StatusUnauthorized, w.Code)
+		}
+	})
+
+	// お気に入り削除のテスト
+	t.Run("RemoveFromWishlist", func(t *testing.T) {
+		req := httptest.NewRequest("DELETE", "/wishlist/500", nil)
+		req.Header.Set("Authorization", "Bearer "+userToken)
+		w := httptest.NewRecorder()
+		removeFromWishlistHandler(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Errorf("Expected status %d, got %d", http.StatusOK, w.Code)
+		}
+
+		var response map[string]interface{}
+		json.NewDecoder(w.Body).Decode(&response)
+		if response["message"] != "Removed from wishlist" {
+			t.Errorf("Expected message 'Removed from wishlist', got %v", response["message"])
+		}
+
+		// 実際にウィッシュリストから削除されているか確認
+		if isProductInWishlist(testUser.ID, 500) {
+			t.Error("Product should not be in wishlist")
+		}
+	})
+
+	// 未登録商品の削除テスト
+	t.Run("RemoveNonexistentFromWishlist", func(t *testing.T) {
+		req := httptest.NewRequest("DELETE", "/wishlist/501", nil)
+		req.Header.Set("Authorization", "Bearer "+userToken)
+		w := httptest.NewRecorder()
+		removeFromWishlistHandler(w, req)
+
+		if w.Code != http.StatusNotFound {
+			t.Errorf("Expected status %d for not in wishlist, got %d", http.StatusNotFound, w.Code)
+		}
+	})
+
+	// 削除（認証なし）
+	t.Run("RemoveFromWishlistWithoutAuth", func(t *testing.T) {
+		req := httptest.NewRequest("DELETE", "/wishlist/500", nil)
+		w := httptest.NewRecorder()
+		removeFromWishlistHandler(w, req)
+
+		if w.Code != http.StatusUnauthorized {
+			t.Errorf("Expected status %d for no auth, got %d", http.StatusUnauthorized, w.Code)
+		}
+	})
+
+	// 不正なHTTPメソッドのテスト
+	t.Run("InvalidMethodForWishlist", func(t *testing.T) {
+		// GETメソッドでお気に入り追加を試みる
+		req := httptest.NewRequest("GET", "/wishlist/500", nil)
+		req.Header.Set("Authorization", "Bearer "+userToken)
+		w := httptest.NewRecorder()
+		addToWishlistHandler(w, req)
+
+		if w.Code != http.StatusMethodNotAllowed {
+			t.Errorf("Expected status %d for invalid method, got %d", http.StatusMethodNotAllowed, w.Code)
+		}
+
+		// PUTメソッドでお気に入り削除を試みる
+		req = httptest.NewRequest("PUT", "/wishlist/500", nil)
+		req.Header.Set("Authorization", "Bearer "+userToken)
+		w = httptest.NewRecorder()
+		removeFromWishlistHandler(w, req)
+
+		if w.Code != http.StatusMethodNotAllowed {
+			t.Errorf("Expected status %d for invalid method, got %d", http.StatusMethodNotAllowed, w.Code)
+		}
+	})
+
+	// クリーンアップ（テスト用のウィッシュリストデータを削除）
+	wishlistMux.Lock()
+	for key := range wishlists {
+		if strings.HasPrefix(key, "50-") {
+			delete(wishlists, key)
+		}
+	}
+	wishlistMux.Unlock()
 }
 
 func TestMainHandler(t *testing.T) {
