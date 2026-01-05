@@ -130,8 +130,111 @@ echo "12. 更新後の商品一覧（在庫が減っているはず）"
 curl -s "$BASE_URL/products" | jq '.'
 echo ""
 
+echo "===== クーポンシステムテスト ====="
+echo ""
+
+# 13. 固定額クーポンのテスト（FLAT1000）
+echo "13. 固定額クーポンテスト（FLAT1000: 1000円割引）"
+echo "   商品1: ノートPC 120,000円 x 1 = 120,000円"
+echo "   商品合計（税抜）: 120,000円"
+echo "   消費税（10%）: 12,000円"
+echo "   送料: 0円（5000円以上）"
+echo "   クーポン割引: 1,000円"
+echo "   予想合計: 131,000円"
+curl -s -X POST "$BASE_URL/orders" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $USER_TOKEN" \
+  -d '{
+    "items": [
+      {"product_id": 1, "quantity": 1}
+    ],
+    "coupon_code": "FLAT1000"
+  }' | jq '.
+  | {
+    order_id: .id,
+    total_price: .total_price,
+    shipping_fee: .shipping_fee,
+    discount_amount: .discount_amount,
+    applied_coupon: .applied_coupon,
+    status: .status,
+    transaction_id: .transaction_id
+  }'
+echo ""
+
+# 14. パーセンテージクーポンのテスト（SAVE20）
+echo "14. パーセンテージクーポンテスト（SAVE20: 20%割引）"
+echo "   商品2: マウス 3,000円 x 1 = 3,000円"
+echo "   商品合計（税抜）: 3,000円"
+echo "   消費税（10%）: 300円"
+echo "   小計: 3,300円"
+echo "   送料: 500円（5000円未満）"
+echo "   クーポン割引: 660円（3,300円の20%）"
+echo "   予想合計: 3,140円"
+curl -s -X POST "$BASE_URL/orders" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $USER_TOKEN" \
+  -d '{
+    "items": [
+      {"product_id": 2, "quantity": 1}
+    ],
+    "coupon_code": "SAVE20"
+  }' | jq '.
+  | {
+    order_id: .id,
+    total_price: .total_price,
+    shipping_fee: .shipping_fee,
+    discount_amount: .discount_amount,
+    applied_coupon: .applied_coupon,
+    status: .status,
+    transaction_id: .transaction_id
+  }'
+echo ""
+
+# 15. 無効なクーポンコードのテスト
+echo "15. 無効なクーポンコードのテスト"
+curl -s -X POST "$BASE_URL/orders" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $USER_TOKEN" \
+  -d '{
+    "items": [
+      {"product_id": 2, "quantity": 1}
+    ],
+    "coupon_code": "INVALID_COUPON"
+  }' | jq '.'
+echo ""
+
+# 16. 複数商品での高額クーポンテスト（FLAT2000）
+echo "16. 複数商品での高額クーポンテスト（FLAT2000: 2000円割引）"
+echo "   商品3: デスク 25,000円 x 1 = 25,000円"
+echo "   商品4: チェア 15,000円 x 1 = 15,000円"
+echo "   商品合計（税抜）: 40,000円"
+echo "   消費税（10%）: 4,000円"
+echo "   送料: 0円（5000円以上）"
+echo "   クーポン割引: 2,000円"
+echo "   予想合計: 42,000円"
+curl -s -X POST "$BASE_URL/orders" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $USER_TOKEN" \
+  -d '{
+    "items": [
+      {"product_id": 3, "quantity": 1},
+      {"product_id": 4, "quantity": 1}
+    ],
+    "coupon_code": "FLAT2000"
+  }' | jq '.
+  | {
+    order_id: .id,
+    total_price: .total_price,
+    shipping_fee: .shipping_fee,
+    discount_amount: .discount_amount,
+    applied_coupon: .applied_coupon,
+    status: .status,
+    transaction_id: .transaction_id
+  }'
+echo ""
+
 echo "===== 決済処理テスト ====="
-echo "13. 決済シミュレーション（90%の確率で成功）"
+echo "17. 決済シミュレーション（90%の確率で成功）"
 echo "   複数回注文を試みて、決済の成功/失敗を確認"
 echo ""
 

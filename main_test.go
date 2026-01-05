@@ -563,6 +563,285 @@ func TestGetAuthUser(t *testing.T) {
 	}
 }
 
+func TestCouponDiscount(t *testing.T) {
+	// 固定額クーポンのテスト
+	t.Run("FixedAmountCoupon", func(t *testing.T) {
+		coupon := &Coupon{
+			Code:   "FLAT1000",
+			Type:   "fixed",
+			Amount: 1000,
+		}
+
+		// 通常の計算
+		discount := calculateCouponDiscount(coupon, 5000)
+		if discount != 1000 {
+			t.Errorf("Expected discount 1000, got %d", discount)
+		}
+
+		// 割引額が商品代金を超える場合
+		discount = calculateCouponDiscount(coupon, 500)
+		if discount != 500 {
+			t.Errorf("Expected discount 500 (capped at base amount), got %d", discount)
+		}
+	})
+
+	// パーセンテージクーポンのテスト
+	t.Run("PercentageCoupon", func(t *testing.T) {
+		coupon := &Coupon{
+			Code:   "SAVE10",
+			Type:   "percentage",
+			Amount: 10,
+		}
+
+		discount := calculateCouponDiscount(coupon, 10000)
+		if discount != 1000 {
+			t.Errorf("Expected discount 1000 (10%% of 10000), got %d", discount)
+		}
+
+		coupon20 := &Coupon{
+			Code:   "SAVE20",
+			Type:   "percentage",
+			Amount: 20,
+		}
+
+		discount = calculateCouponDiscount(coupon20, 5000)
+		if discount != 1000 {
+			t.Errorf("Expected discount 1000 (20%% of 5000), got %d", discount)
+		}
+	})
+
+	// nilクーポンのテスト
+	t.Run("NilCoupon", func(t *testing.T) {
+		discount := calculateCouponDiscount(nil, 10000)
+		if discount != 0 {
+			t.Errorf("Expected discount 0 for nil coupon, got %d", discount)
+		}
+	})
+
+	// 無効なクーポンタイプのテスト
+	t.Run("InvalidCouponType", func(t *testing.T) {
+		coupon := &Coupon{
+			Code:   "INVALID",
+			Type:   "invalid_type",
+			Amount: 1000,
+		}
+
+		discount := calculateCouponDiscount(coupon, 5000)
+		if discount != 0 {
+			t.Errorf("Expected discount 0 for invalid coupon type, got %d", discount)
+		}
+	})
+}
+
+func TestCreateOrderWithCoupon(t *testing.T) {
+	// 元の決済ゲートウェイを保存して後で復元
+	originalGateway := paymentGateway
+	defer func() { paymentGateway = originalGateway }()
+
+	// 決済成功のモックを設定
+	paymentGateway = &MockPaymentGateway{shouldSucceed: true}
+
+	// テスト用ユーザーとトークンを設定
+	testUser := &User{ID: 10, Username: "couponuser", IsAdmin: false}
+	userToken := "coupon-test-token"
+	sessionMux.Lock()
+	sessions[userToken] = testUser
+	sessionMux.Unlock()
+
+	// テスト用商品を追加
+	productMux.Lock()
+	products[300] = &Product{ID: 300, Name: "テスト商品A", Price: 3000, Category: "テスト"}
+	products[301] = &Product{ID: 301, Name: "テスト商品B", Price: 10000, Category: "テスト"}
+	productMux.Unlock()
+
+	// テスト用在庫を追加
+	stockMux.Lock()
+	stocks["300-1"] = &Stock{ProductID: 300, WarehouseID: 1, Quantity: 20}
+	stocks["301-1"] = &Stock{ProductID: 301, WarehouseID: 1, Quantity: 10}
+	stockMux.Unlock()
+
+	// 固定額クーポンで送料無料のケース
+	t.Run("FixedCouponWithFreeShipping", func(t *testing.T) {
+		reqBody := `{"items": [{"product_id": 301, "quantity": 1}], "coupon_code": "FLAT1000"}`
+		req := httptest.NewRequest("POST", "/orders", bytes.NewBufferString(reqBody))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+userToken)
+		w := httptest.NewRecorder()
+		createOrderHandler(w, req)
+
+		if w.Code != http.StatusCreated {
+			t.Errorf("Expected status %d, got %d", http.StatusCreated, w.Code)
+		}
+
+		var order Order
+		json.NewDecoder(w.Body).Decode(&order)
+		// 商品: 10000円, 消費税: 1000円, 小計: 11000円
+		// 送料: 0円（5000円以上）
+		// クーポン割引: 1000円（固定額）
+		// 合計: 11000 - 1000 + 0 = 10000円
+		expectedTotal := 10000
+		if order.TotalPrice != expectedTotal {
+			t.Errorf("Expected total %d with FLAT1000 coupon, got %d", expectedTotal, order.TotalPrice)
+		}
+		if order.DiscountAmount != 1000 {
+			t.Errorf("Expected discount 1000, got %d", order.DiscountAmount)
+		}
+		if order.AppliedCoupon != "FLAT1000" {
+			t.Errorf("Expected applied coupon FLAT1000, got %s", order.AppliedCoupon)
+		}
+		if order.ShippingFee != 0 {
+			t.Errorf("Expected shipping fee 0, got %d", order.ShippingFee)
+		}
+	})
+
+	// パーセンテージクーポンで送料ありのケース
+	t.Run("PercentageCouponWithShipping", func(t *testing.T) {
+		reqBody := `{"items": [{"product_id": 300, "quantity": 1}], "coupon_code": "SAVE20"}`
+		req := httptest.NewRequest("POST", "/orders", bytes.NewBufferString(reqBody))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+userToken)
+		w := httptest.NewRecorder()
+		createOrderHandler(w, req)
+
+		if w.Code != http.StatusCreated {
+			t.Errorf("Expected status %d, got %d", http.StatusCreated, w.Code)
+		}
+
+		var order Order
+		json.NewDecoder(w.Body).Decode(&order)
+		// 商品: 3000円, 消費税: 300円, 小計: 3300円
+		// 送料: 500円（5000円未満）
+		// クーポン割引: 660円（3300円の20%）
+		// 合計: 3300 - 660 + 500 = 3140円
+		expectedTotal := 3140
+		if order.TotalPrice != expectedTotal {
+			t.Errorf("Expected total %d with SAVE20 coupon, got %d", expectedTotal, order.TotalPrice)
+		}
+		if order.DiscountAmount != 660 {
+			t.Errorf("Expected discount 660 (20%% of 3300), got %d", order.DiscountAmount)
+		}
+		if order.AppliedCoupon != "SAVE20" {
+			t.Errorf("Expected applied coupon SAVE20, got %s", order.AppliedCoupon)
+		}
+		if order.ShippingFee != 500 {
+			t.Errorf("Expected shipping fee 500, got %d", order.ShippingFee)
+		}
+	})
+
+	// 無効なクーポンコードのテスト
+	t.Run("InvalidCouponCode", func(t *testing.T) {
+		reqBody := `{"items": [{"product_id": 300, "quantity": 1}], "coupon_code": "INVALID_CODE"}`
+		req := httptest.NewRequest("POST", "/orders", bytes.NewBufferString(reqBody))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+userToken)
+		w := httptest.NewRecorder()
+		createOrderHandler(w, req)
+
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("Expected status %d for invalid coupon, got %d", http.StatusBadRequest, w.Code)
+		}
+	})
+
+	// クーポンなしの注文（既存機能の確認）
+	t.Run("OrderWithoutCoupon", func(t *testing.T) {
+		reqBody := `{"items": [{"product_id": 300, "quantity": 2}]}`
+		req := httptest.NewRequest("POST", "/orders", bytes.NewBufferString(reqBody))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+userToken)
+		w := httptest.NewRecorder()
+		createOrderHandler(w, req)
+
+		if w.Code != http.StatusCreated {
+			t.Errorf("Expected status %d, got %d", http.StatusCreated, w.Code)
+		}
+
+		var order Order
+		json.NewDecoder(w.Body).Decode(&order)
+		// 商品: 6000円, 消費税: 600円, 小計: 6600円
+		// 送料: 0円（5000円以上）
+		// クーポン割引: 0円
+		// 合計: 6600円
+		expectedTotal := 6600
+		if order.TotalPrice != expectedTotal {
+			t.Errorf("Expected total %d without coupon, got %d", expectedTotal, order.TotalPrice)
+		}
+		if order.DiscountAmount != 0 {
+			t.Errorf("Expected discount 0, got %d", order.DiscountAmount)
+		}
+		if order.AppliedCoupon != "" {
+			t.Errorf("Expected no applied coupon, got %s", order.AppliedCoupon)
+		}
+	})
+
+	// 複数商品でのクーポン適用テスト
+	t.Run("MultipleItemsWithCoupon", func(t *testing.T) {
+		reqBody := `{"items": [{"product_id": 300, "quantity": 2}, {"product_id": 301, "quantity": 1}], "coupon_code": "FLAT2000"}`
+		req := httptest.NewRequest("POST", "/orders", bytes.NewBufferString(reqBody))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+userToken)
+		w := httptest.NewRecorder()
+		createOrderHandler(w, req)
+
+		if w.Code != http.StatusCreated {
+			t.Errorf("Expected status %d, got %d", http.StatusCreated, w.Code)
+		}
+
+		var order Order
+		json.NewDecoder(w.Body).Decode(&order)
+		// 商品: 3000*2 + 10000 = 16000円, 消費税: 1600円, 小計: 17600円
+		// 送料: 0円（5000円以上）
+		// クーポン割引: 2000円（固定額）
+		// 合計: 17600 - 2000 + 0 = 15600円
+		expectedTotal := 15600
+		if order.TotalPrice != expectedTotal {
+			t.Errorf("Expected total %d with FLAT2000 coupon, got %d", expectedTotal, order.TotalPrice)
+		}
+		if order.DiscountAmount != 2000 {
+			t.Errorf("Expected discount 2000, got %d", order.DiscountAmount)
+		}
+	})
+
+	// 決済失敗時のクーポン処理テスト
+	t.Run("PaymentFailureWithCoupon", func(t *testing.T) {
+		// 決済失敗のモックを設定
+		paymentGateway = &MockPaymentGateway{shouldSucceed: false}
+
+		reqBody := `{"items": [{"product_id": 300, "quantity": 1}], "coupon_code": "SAVE10"}`
+		req := httptest.NewRequest("POST", "/orders", bytes.NewBufferString(reqBody))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+userToken)
+		w := httptest.NewRecorder()
+		createOrderHandler(w, req)
+
+		if w.Code != http.StatusPaymentRequired {
+			t.Errorf("Expected status %d for payment failure, got %d", http.StatusPaymentRequired, w.Code)
+		}
+
+		// 注文が失敗ステータスで保存されているか確認
+		orderMux.RLock()
+		var failedOrder *Order
+		for _, o := range orders {
+			if o.UserID == testUser.ID && o.Status == "payment_failed" && o.AppliedCoupon == "SAVE10" {
+				failedOrder = o
+				break
+			}
+		}
+		orderMux.RUnlock()
+
+		if failedOrder == nil {
+			t.Error("Failed order with coupon should be saved with payment_failed status")
+		} else {
+			// クーポン情報が保存されているか確認
+			if failedOrder.AppliedCoupon != "SAVE10" {
+				t.Errorf("Expected applied coupon SAVE10 in failed order, got %s", failedOrder.AppliedCoupon)
+			}
+			if failedOrder.DiscountAmount != 330 { // 3300円の10%
+				t.Errorf("Expected discount amount 330 in failed order, got %d", failedOrder.DiscountAmount)
+			}
+		}
+	})
+}
+
 func TestMainHandler(t *testing.T) {
 	// 404のテスト
 	req := httptest.NewRequest("GET", "/nonexistent", nil)

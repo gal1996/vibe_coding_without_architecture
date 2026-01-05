@@ -64,13 +64,23 @@ type OrderItem struct {
 }
 
 type Order struct {
-	ID          int         `json:"id"`
-	UserID      int         `json:"user_id"`
-	Items       []OrderItem `json:"items"`
-	TotalPrice  int         `json:"total_price"`
-	ShippingFee int         `json:"shipping_fee"`
-	Status      string      `json:"status"`
-	CreatedAt   time.Time   `json:"created_at"`
+	ID             int         `json:"id"`
+	UserID         int         `json:"user_id"`
+	Items          []OrderItem `json:"items"`
+	TotalPrice     int         `json:"total_price"`
+	ShippingFee    int         `json:"shipping_fee"`
+	DiscountAmount int         `json:"discount_amount"`
+	AppliedCoupon  string      `json:"applied_coupon,omitempty"`
+	Status         string      `json:"status"`
+	CreatedAt      time.Time   `json:"created_at"`
+}
+
+// クーポンエンティティ
+type Coupon struct {
+	Code         string `json:"code"`
+	Type         string `json:"type"`         // "fixed" or "percentage"
+	Amount       int    `json:"amount"`       // 固定額または割合（%）
+	Description  string `json:"description"`
 }
 
 // 決済関連の型定義
@@ -93,6 +103,7 @@ var (
 	usersByName = make(map[string]*User)
 	orders      = make(map[int]*Order)
 	sessions    = make(map[string]*User)
+	coupons     = make(map[string]*Coupon)
 
 	productMux   sync.RWMutex
 	warehouseMux sync.RWMutex
@@ -100,6 +111,7 @@ var (
 	userMux      sync.RWMutex
 	orderMux     sync.RWMutex
 	sessionMux   sync.RWMutex
+	couponMux    sync.RWMutex
 
 	nextProductID   = 1
 	nextWarehouseID = 1
@@ -198,6 +210,32 @@ func init() {
 	stocks["4-1"] = &Stock{ProductID: 4, WarehouseID: 1, Quantity: 3}
 	stocks["4-2"] = &Stock{ProductID: 4, WarehouseID: 2, Quantity: 3}
 	stocks["4-3"] = &Stock{ProductID: 4, WarehouseID: 3, Quantity: 2}
+
+	// クーポンマスターデータを作成
+	coupons["SAVE10"] = &Coupon{
+		Code:        "SAVE10",
+		Type:        "percentage",
+		Amount:      10,
+		Description: "10%割引クーポン",
+	}
+	coupons["SAVE20"] = &Coupon{
+		Code:        "SAVE20",
+		Type:        "percentage",
+		Amount:      20,
+		Description: "20%割引クーポン",
+	}
+	coupons["FLAT1000"] = &Coupon{
+		Code:        "FLAT1000",
+		Type:        "fixed",
+		Amount:      1000,
+		Description: "1000円割引クーポン",
+	}
+	coupons["FLAT2000"] = &Coupon{
+		Code:        "FLAT2000",
+		Type:        "fixed",
+		Amount:      2000,
+		Description: "2000円割引クーポン",
+	}
 }
 
 // ユーティリティ関数
@@ -299,6 +337,30 @@ func allocateStock(productID int, requiredQuantity int) (allocated bool, allocat
 	}
 
 	return false, nil
+}
+
+// クーポン割引計算ヘルパー関数
+func calculateCouponDiscount(coupon *Coupon, baseAmount int) int {
+	if coupon == nil {
+		return 0
+	}
+
+	var discount int
+	switch coupon.Type {
+	case "fixed":
+		discount = coupon.Amount
+	case "percentage":
+		discount = baseAmount * coupon.Amount / 100
+	default:
+		return 0
+	}
+
+	// 割引額が元の金額を超えないようにする
+	if discount > baseAmount {
+		discount = baseAmount
+	}
+
+	return discount
 }
 
 // ハンドラー関数
@@ -568,7 +630,8 @@ func createOrderHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		Items []OrderItem `json:"items"`
+		Items      []OrderItem `json:"items"`
+		CouponCode string      `json:"coupon_code,omitempty"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -579,6 +642,19 @@ func createOrderHandler(w http.ResponseWriter, r *http.Request) {
 	if len(req.Items) == 0 {
 		errorResponse(w, http.StatusBadRequest, "No items in order")
 		return
+	}
+
+	// クーポンコードのバリデーション
+	var appliedCoupon *Coupon
+	if req.CouponCode != "" {
+		couponMux.RLock()
+		appliedCoupon = coupons[req.CouponCode]
+		couponMux.RUnlock()
+
+		if appliedCoupon == nil {
+			errorResponse(w, http.StatusBadRequest, "Invalid coupon code")
+			return
+		}
 	}
 
 	// 在庫チェックと合計金額計算（税抜）
@@ -618,17 +694,25 @@ func createOrderHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	productMux.RUnlock()
 
-	// 消費税計算（10%）
-	tax := subtotal / 10
+	// 支払い金額の算出アルゴリズム（仕様書の順序に従う）
+	// 1. 商品小計（既に計算済み: subtotal）
 
-	// 送料計算（5000円未満の場合は500円、5000円以上は無料）
+	// 2. 消費税の加算（10%）
+	tax := subtotal / 10
+	subtotalWithTax := subtotal + tax
+
+	// 3. 送料の確定（消費税加算後の金額に基づく）
 	shippingFee := 0
-	if subtotal < 5000 {
+	if subtotalWithTax < 5000 {
 		shippingFee = 500
 	}
 
-	// 合計金額（税込 + 送料）
-	totalPrice := subtotal + tax + shippingFee
+	// 4. クーポン割引の適用（商品代金＋消費税に対して、送料は対象外）
+	discountAmount := calculateCouponDiscount(appliedCoupon, subtotalWithTax)
+	discountedAmount := subtotalWithTax - discountAmount
+
+	// 5. 最終金額の確定（割引後金額＋送料）
+	totalPrice := discountedAmount + shippingFee
 
 	// 注文IDを先に生成（決済処理で必要）
 	orderID := nextOrderID
@@ -638,12 +722,14 @@ func createOrderHandler(w http.ResponseWriter, r *http.Request) {
 
 	// 注文オブジェクトを作成
 	order := &Order{
-		ID:          orderID,
-		UserID:      user.ID,
-		Items:       req.Items,
-		TotalPrice:  totalPrice,
-		ShippingFee: shippingFee,
-		CreatedAt:   time.Now(),
+		ID:             orderID,
+		UserID:         user.ID,
+		Items:          req.Items,
+		TotalPrice:     totalPrice,
+		ShippingFee:    shippingFee,
+		DiscountAmount: discountAmount,
+		AppliedCoupon:  req.CouponCode,
+		CreatedAt:      time.Now(),
 	}
 
 	if paymentResult.Success {
