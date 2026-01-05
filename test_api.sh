@@ -280,4 +280,17 @@ for i in {1..5}; do
 done
 
 echo ""
+
+echo "===== 販売分析レポートテスト（管理者向け） ====="
+echo "18. 管理者による販売分析レポート取得"
+echo ""
+curl -s "$BASE_URL/admin/reports/sales" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" | jq '.'
+echo ""
+
+echo "19. 一般ユーザーによるレポートアクセス（失敗するはず）"
+curl -s "$BASE_URL/admin/reports/sales" \
+  -H "Authorization: Bearer $USER_TOKEN" | jq '.'
+echo ""
+
 echo "===== テスト完了 ====="

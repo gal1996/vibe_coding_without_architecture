@@ -83,6 +83,33 @@ type Coupon struct {
 	Description  string `json:"description"`
 }
 
+// 販売分析レポート関連の型定義
+type SalesReportResponse struct {
+	SalesSummary         SalesSummary             `json:"sales_summary"`
+	TopProducts          []ProductRanking         `json:"top_products"`
+	WarehouseInventory   []WarehouseInventoryStat `json:"warehouse_inventory"`
+	PromotionAnalysis    PromotionAnalysis        `json:"promotion_analysis"`
+}
+
+type SalesSummary struct {
+	TotalRevenue int `json:"total_revenue"`
+	TotalOrders  int `json:"total_orders"`
+}
+
+type ProductRanking struct {
+	ProductName   string `json:"product_name"`
+	TotalQuantity int    `json:"total_quantity"`
+}
+
+type WarehouseInventoryStat struct {
+	WarehouseName string `json:"warehouse_name"`
+	TotalStock    int    `json:"total_stock"`
+}
+
+type PromotionAnalysis struct {
+	CouponUsageRate float64 `json:"coupon_usage_rate"` // パーセンテージ（0-100）
+}
+
 // 決済関連の型定義
 type PaymentResult struct {
 	Success       bool   `json:"success"`
@@ -361,6 +388,128 @@ func calculateCouponDiscount(coupon *Coupon, baseAmount int) int {
 	}
 
 	return discount
+}
+
+// 販売分析レポート集計関数
+func generateSalesReport() *SalesReportResponse {
+	report := &SalesReportResponse{}
+
+	// 1. 販売サマリーの集計
+	orderMux.RLock()
+	totalRevenue := 0
+	completedOrders := 0
+	couponUsedOrders := 0
+	totalOrdersForCouponRate := 0
+	productQuantities := make(map[int]int) // productID -> total quantity
+
+	for _, order := range orders {
+		// クーポン利用率の計算用（全注文をカウント）
+		if order.Status == "completed" || order.Status == "payment_failed" {
+			totalOrdersForCouponRate++
+			if order.AppliedCoupon != "" {
+				couponUsedOrders++
+			}
+		}
+
+		// 売上とランキングは完了した注文のみ
+		if order.Status == "completed" {
+			totalRevenue += order.TotalPrice
+			completedOrders++
+
+			// 商品ごとの販売数量を集計
+			for _, item := range order.Items {
+				productQuantities[item.ProductID] += item.Quantity
+			}
+		}
+	}
+	orderMux.RUnlock()
+
+	report.SalesSummary = SalesSummary{
+		TotalRevenue: totalRevenue,
+		TotalOrders:  completedOrders,
+	}
+
+	// 2. 人気商品ランキング（トップ3）
+	type productQty struct {
+		ID       int
+		Name     string
+		Quantity int
+	}
+	var rankings []productQty
+
+	productMux.RLock()
+	for productID, qty := range productQuantities {
+		if product, exists := products[productID]; exists {
+			rankings = append(rankings, productQty{
+				ID:       productID,
+				Name:     product.Name,
+				Quantity: qty,
+			})
+		}
+	}
+	productMux.RUnlock()
+
+	// 販売数量でソート（降順）
+	for i := 0; i < len(rankings); i++ {
+		for j := i + 1; j < len(rankings); j++ {
+			if rankings[j].Quantity > rankings[i].Quantity {
+				rankings[i], rankings[j] = rankings[j], rankings[i]
+			}
+		}
+	}
+
+	// トップ3を取得
+	topProducts := []ProductRanking{}
+	for i := 0; i < len(rankings) && i < 3; i++ {
+		topProducts = append(topProducts, ProductRanking{
+			ProductName:   rankings[i].Name,
+			TotalQuantity: rankings[i].Quantity,
+		})
+	}
+	report.TopProducts = topProducts
+
+	// 3. 倉庫別在庫サマリー
+	warehouseStocks := make(map[int]int) // warehouseID -> total stock
+	stockMux.RLock()
+	for _, stock := range stocks {
+		if stock.Quantity > 0 {
+			warehouseStocks[stock.WarehouseID] += stock.Quantity
+		}
+	}
+	stockMux.RUnlock()
+
+	var warehouseInventory []WarehouseInventoryStat
+	warehouseMux.RLock()
+	for warehouseID, totalStock := range warehouseStocks {
+		if warehouse, exists := warehouses[warehouseID]; exists {
+			warehouseInventory = append(warehouseInventory, WarehouseInventoryStat{
+				WarehouseName: warehouse.Name,
+				TotalStock:    totalStock,
+			})
+		}
+	}
+	warehouseMux.RUnlock()
+
+	// 倉庫名でソート（安定した出力のため）
+	for i := 0; i < len(warehouseInventory); i++ {
+		for j := i + 1; j < len(warehouseInventory); j++ {
+			if warehouseInventory[j].WarehouseName < warehouseInventory[i].WarehouseName {
+				warehouseInventory[i], warehouseInventory[j] = warehouseInventory[j], warehouseInventory[i]
+			}
+		}
+	}
+	report.WarehouseInventory = warehouseInventory
+
+	// 4. プロモーション効果分析
+	couponUsageRate := 0.0
+	if totalOrdersForCouponRate > 0 {
+		couponUsageRate = float64(couponUsedOrders) / float64(totalOrdersForCouponRate) * 100
+	}
+	report.PromotionAnalysis = PromotionAnalysis{
+		CouponUsageRate: couponUsageRate,
+	}
+
+	return report
 }
 
 // ハンドラー関数
@@ -816,6 +965,31 @@ func getOrdersHandler(w http.ResponseWriter, r *http.Request) {
 	jsonResponse(w, http.StatusOK, userOrders)
 }
 
+// 販売分析レポート取得（管理者のみ）
+func getSalesReportHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		errorResponse(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+
+	// 認証確認
+	user := getAuthUser(r)
+	if user == nil {
+		errorResponse(w, http.StatusUnauthorized, "Unauthorized")
+		return
+	}
+
+	// 管理者権限確認
+	if !user.IsAdmin {
+		errorResponse(w, http.StatusForbidden, "Admin access required")
+		return
+	}
+
+	// レポート生成
+	report := generateSalesReport()
+	jsonResponse(w, http.StatusOK, report)
+}
+
 // メインハンドラー
 func mainHandler(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
@@ -836,6 +1010,8 @@ func mainHandler(w http.ResponseWriter, r *http.Request) {
 		createOrderHandler(w, r)
 	case path == "/orders" && r.Method == "GET":
 		getOrdersHandler(w, r)
+	case path == "/admin/reports/sales" && r.Method == "GET":
+		getSalesReportHandler(w, r)
 	default:
 		errorResponse(w, http.StatusNotFound, "Not found")
 	}
@@ -853,6 +1029,7 @@ func main() {
 	fmt.Println("  POST   /login                 - Login")
 	fmt.Println("  POST   /orders                - Create order (auth required)")
 	fmt.Println("  GET    /orders                - Get user's orders (auth required)")
+	fmt.Println("  GET    /admin/reports/sales   - Sales analysis report (admin only)")
 	fmt.Println("\nDefault admin credentials: username=admin, password=admin123")
 
 	http.HandleFunc("/", mainHandler)

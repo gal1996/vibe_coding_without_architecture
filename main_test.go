@@ -842,6 +842,213 @@ func TestCreateOrderWithCoupon(t *testing.T) {
 	})
 }
 
+func TestSalesReportHandler(t *testing.T) {
+	// 元の決済ゲートウェイを保存して後で復元
+	originalGateway := paymentGateway
+	defer func() { paymentGateway = originalGateway }()
+
+	// 決済成功のモックを設定
+	paymentGateway = &MockPaymentGateway{shouldSucceed: true}
+
+	// 管理者トークンを設定
+	adminUser := &User{ID: 1, Username: "admin", IsAdmin: true}
+	adminToken := "admin-report-token"
+	sessionMux.Lock()
+	sessions[adminToken] = adminUser
+	sessionMux.Unlock()
+
+	// 一般ユーザートークンを設定
+	regularUser := &User{ID: 11, Username: "regularuser", IsAdmin: false}
+	regularToken := "regular-report-token"
+	sessionMux.Lock()
+	sessions[regularToken] = regularUser
+	sessionMux.Unlock()
+
+	// テストデータの準備 - 商品を追加
+	productMux.Lock()
+	products[400] = &Product{ID: 400, Name: "レポート商品A", Price: 5000, Category: "テスト"}
+	products[401] = &Product{ID: 401, Name: "レポート商品B", Price: 10000, Category: "テスト"}
+	products[402] = &Product{ID: 402, Name: "レポート商品C", Price: 3000, Category: "テスト"}
+	productMux.Unlock()
+
+	// 在庫を追加（既存の在庫を一時的に退避）
+	stockMux.Lock()
+	originalStocks := stocks
+	stocks = make(map[string]*Stock)
+	stocks["400-1"] = &Stock{ProductID: 400, WarehouseID: 1, Quantity: 10}
+	stocks["400-2"] = &Stock{ProductID: 400, WarehouseID: 2, Quantity: 5}
+	stocks["401-1"] = &Stock{ProductID: 401, WarehouseID: 1, Quantity: 8}
+	stocks["402-3"] = &Stock{ProductID: 402, WarehouseID: 3, Quantity: 12}
+	stockMux.Unlock()
+
+	// テスト後に在庫を復元
+	defer func() {
+		stockMux.Lock()
+		stocks = originalStocks
+		stockMux.Unlock()
+	}()
+
+	// テスト用の注文を作成（既存の注文も一時的に退避）
+	orderMux.Lock()
+	originalOrders := orders
+	orders = make(map[int]*Order)
+	// テスト後に注文を復元
+	defer func() {
+		orderMux.Lock()
+		orders = originalOrders
+		orderMux.Unlock()
+	}()
+
+	// 完了した注文（集計対象）
+	orders[2000] = &Order{
+		ID:         2000,
+		UserID:     11,
+		Items:      []OrderItem{{ProductID: 400, Quantity: 3}, {ProductID: 401, Quantity: 2}},
+		TotalPrice: 25000,
+		Status:     "completed",
+		AppliedCoupon: "SAVE10",
+	}
+	orders[2001] = &Order{
+		ID:         2001,
+		UserID:     11,
+		Items:      []OrderItem{{ProductID: 401, Quantity: 1}},
+		TotalPrice: 11000,
+		Status:     "completed",
+	}
+	orders[2002] = &Order{
+		ID:         2002,
+		UserID:     11,
+		Items:      []OrderItem{{ProductID: 402, Quantity: 5}},
+		TotalPrice: 16500,
+		Status:     "completed",
+		AppliedCoupon: "FLAT1000",
+	}
+	// 失敗した注文（集計から除外）
+	orders[2003] = &Order{
+		ID:         2003,
+		UserID:     11,
+		Items:      []OrderItem{{ProductID: 400, Quantity: 10}},
+		TotalPrice: 55000,
+		Status:     "payment_failed",
+		AppliedCoupon: "SAVE20",
+	}
+	orderMux.Unlock()
+
+	// 管理者によるレポート取得のテスト
+	t.Run("AdminAccessReport", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/admin/reports/sales", nil)
+		req.Header.Set("Authorization", "Bearer "+adminToken)
+		w := httptest.NewRecorder()
+		getSalesReportHandler(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Errorf("Expected status %d, got %d", http.StatusOK, w.Code)
+		}
+
+		var report SalesReportResponse
+		json.NewDecoder(w.Body).Decode(&report)
+
+		// 売上サマリーの検証
+		expectedRevenue := 25000 + 11000 + 16500 // 52500
+		if report.SalesSummary.TotalRevenue != expectedRevenue {
+			t.Errorf("Expected total revenue %d, got %d", expectedRevenue, report.SalesSummary.TotalRevenue)
+		}
+		if report.SalesSummary.TotalOrders != 3 {
+			t.Errorf("Expected 3 completed orders, got %d", report.SalesSummary.TotalOrders)
+		}
+
+		// 人気商品ランキングの検証（商品402が5個、商品401が3個、商品400が3個の順）
+		if len(report.TopProducts) > 0 {
+			if report.TopProducts[0].ProductName != "レポート商品C" || report.TopProducts[0].TotalQuantity != 5 {
+				t.Errorf("Expected top product to be レポート商品C with 5 sales, got %s with %d",
+					report.TopProducts[0].ProductName, report.TopProducts[0].TotalQuantity)
+			}
+		}
+
+		// 倉庫別在庫の検証
+		foundTokyo := false
+		for _, warehouse := range report.WarehouseInventory {
+			if warehouse.WarehouseName == "東京倉庫" {
+				foundTokyo = true
+				expectedStock := 10 + 8 // 商品400と401の在庫
+				if warehouse.TotalStock != expectedStock {
+					t.Errorf("Expected Tokyo warehouse stock %d, got %d", expectedStock, warehouse.TotalStock)
+				}
+				break
+			}
+		}
+		if !foundTokyo {
+			t.Error("Tokyo warehouse not found in inventory report")
+		}
+
+		// クーポン利用率の検証（4注文中3つでクーポン使用 = 75%）
+		expectedRate := 75.0
+		if report.PromotionAnalysis.CouponUsageRate != expectedRate {
+			t.Errorf("Expected coupon usage rate %.1f%%, got %.1f%%",
+				expectedRate, report.PromotionAnalysis.CouponUsageRate)
+		}
+	})
+
+	// 一般ユーザーによるアクセス拒否のテスト
+	t.Run("RegularUserAccessDenied", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/admin/reports/sales", nil)
+		req.Header.Set("Authorization", "Bearer "+regularToken)
+		w := httptest.NewRecorder()
+		getSalesReportHandler(w, req)
+
+		if w.Code != http.StatusForbidden {
+			t.Errorf("Expected status %d for non-admin, got %d", http.StatusForbidden, w.Code)
+		}
+	})
+
+	// 認証なしでのアクセス拒否のテスト
+	t.Run("UnauthenticatedAccessDenied", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/admin/reports/sales", nil)
+		w := httptest.NewRecorder()
+		getSalesReportHandler(w, req)
+
+		if w.Code != http.StatusUnauthorized {
+			t.Errorf("Expected status %d for unauthenticated, got %d", http.StatusUnauthorized, w.Code)
+		}
+	})
+
+	// データがない場合のテスト
+	t.Run("EmptyDataReport", func(t *testing.T) {
+		// 既存の注文を一時的に退避
+		orderMux.Lock()
+		tempOrders := orders
+		orders = make(map[int]*Order)
+		orderMux.Unlock()
+
+		req := httptest.NewRequest("GET", "/admin/reports/sales", nil)
+		req.Header.Set("Authorization", "Bearer "+adminToken)
+		w := httptest.NewRecorder()
+		getSalesReportHandler(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Errorf("Expected status %d for empty data, got %d", http.StatusOK, w.Code)
+		}
+
+		var report SalesReportResponse
+		json.NewDecoder(w.Body).Decode(&report)
+
+		if report.SalesSummary.TotalRevenue != 0 {
+			t.Errorf("Expected 0 revenue for empty data, got %d", report.SalesSummary.TotalRevenue)
+		}
+		if report.SalesSummary.TotalOrders != 0 {
+			t.Errorf("Expected 0 orders for empty data, got %d", report.SalesSummary.TotalOrders)
+		}
+		if len(report.TopProducts) != 0 {
+			t.Errorf("Expected empty top products, got %d", len(report.TopProducts))
+		}
+
+		// データを復元
+		orderMux.Lock()
+		orders = tempOrders
+		orderMux.Unlock()
+	})
+}
+
 func TestMainHandler(t *testing.T) {
 	// 404のテスト
 	req := httptest.NewRequest("GET", "/nonexistent", nil)
