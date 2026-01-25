@@ -386,6 +386,10 @@ MT-8 追加機能仕様書：ポイントプログラムおよび会員ランク
 ```
 - **完了時刻**: 00:27:00
 - **実行時間**: 19分
+- **備考**:
+  - 実装中に2件のバグを発見・修正：
+    1. テストユーザーに新フィールド（CurrentPoints, TotalSpentAmount, MemberRank）が未設定でnil pointer dereferenceが発生
+    2. SilverMemberDiscountテストの期待値誤り（送料無料条件を考慮していなかった）
 
 ---
 
