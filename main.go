@@ -51,11 +51,14 @@ type StockWarehouse struct {
 }
 
 type User struct {
-	ID           int    `json:"id"`
-	Username     string `json:"username"`
-	PasswordHash string `json:"-"`
-	IsAdmin      bool   `json:"is_admin"`
-	Token        string `json:"token,omitempty"`
+	ID               int    `json:"id"`
+	Username         string `json:"username"`
+	PasswordHash     string `json:"-"`
+	IsAdmin          bool   `json:"is_admin"`
+	Token            string `json:"token,omitempty"`
+	CurrentPoints    int    `json:"current_points"`
+	TotalSpentAmount int    `json:"total_spent_amount"`
+	MemberRank       string `json:"rank"` // "Normal", "Silver", "Gold"
 }
 
 type OrderItem struct {
@@ -73,6 +76,9 @@ type Order struct {
 	AppliedCoupon  string      `json:"applied_coupon,omitempty"`
 	Status         string      `json:"status"`
 	CreatedAt      time.Time   `json:"created_at"`
+	EarnedPoints   int         `json:"earned_points"`
+	UsedPoints     int         `json:"used_points"`
+	RankDiscount   int         `json:"rank_discount"` // ランク割引額
 }
 
 // クーポンエンティティ
@@ -133,6 +139,27 @@ type RecommendedProduct struct {
 	Category string `json:"category"`
 }
 
+// ポイント履歴エンティティ
+type PointHistory struct {
+	ID        int       `json:"id"`
+	UserID    int       `json:"user_id"`
+	OrderID   int       `json:"order_id"`
+	Type      string    `json:"type"`      // "earned" or "used"
+	Amount    int       `json:"amount"`
+	Balance   int       `json:"balance"`   // 残高
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// ユーザー情報レスポンス用構造体
+type UserInfoResponse struct {
+	ID               int    `json:"id"`
+	Username         string `json:"username"`
+	IsAdmin          bool   `json:"is_admin"`
+	Rank             string `json:"rank"`
+	TotalSpentAmount int    `json:"total_spent_amount"`
+	CurrentPoints    int    `json:"current_points"`
+}
+
 // 決済関連の型定義
 type PaymentResult struct {
 	Success       bool   `json:"success"`
@@ -146,29 +173,32 @@ type PaymentGateway interface {
 
 // データストア（インメモリ）
 var (
-	products    = make(map[int]*Product)
-	warehouses  = make(map[int]*Warehouse)
-	stocks      = make(map[string]*Stock) // key: "productID-warehouseID"
-	users       = make(map[int]*User)
-	usersByName = make(map[string]*User)
-	orders      = make(map[int]*Order)
-	sessions    = make(map[string]*User)
-	coupons     = make(map[string]*Coupon)
-	wishlists   = make(map[string]*Wishlist) // key: "userID-productID"
+	products      = make(map[int]*Product)
+	warehouses    = make(map[int]*Warehouse)
+	stocks        = make(map[string]*Stock) // key: "productID-warehouseID"
+	users         = make(map[int]*User)
+	usersByName   = make(map[string]*User)
+	orders        = make(map[int]*Order)
+	sessions      = make(map[string]*User)
+	coupons       = make(map[string]*Coupon)
+	wishlists     = make(map[string]*Wishlist) // key: "userID-productID"
+	pointHistories = make(map[int]*PointHistory)
 
-	productMux   sync.RWMutex
-	warehouseMux sync.RWMutex
-	stockMux     sync.RWMutex
-	userMux      sync.RWMutex
-	orderMux     sync.RWMutex
-	sessionMux   sync.RWMutex
-	couponMux    sync.RWMutex
-	wishlistMux  sync.RWMutex
+	productMux      sync.RWMutex
+	warehouseMux    sync.RWMutex
+	stockMux        sync.RWMutex
+	userMux         sync.RWMutex
+	orderMux        sync.RWMutex
+	sessionMux      sync.RWMutex
+	couponMux       sync.RWMutex
+	wishlistMux     sync.RWMutex
+	pointHistoryMux sync.RWMutex
 
-	nextProductID   = 1
-	nextWarehouseID = 1
-	nextUserID      = 1
-	nextOrderID     = 1
+	nextProductID      = 1
+	nextWarehouseID    = 1
+	nextUserID         = 1
+	nextOrderID        = 1
+	nextPointHistoryID = 1
 )
 
 // ダミー決済ゲートウェイの実装
@@ -213,10 +243,13 @@ func init() {
 	// 管理者ユーザーを作成
 	adminPass, _ := bcrypt.GenerateFromPassword([]byte("admin123"), bcrypt.DefaultCost)
 	admin := &User{
-		ID:           nextUserID,
-		Username:     "admin",
-		PasswordHash: string(adminPass),
-		IsAdmin:      true,
+		ID:               nextUserID,
+		Username:         "admin",
+		PasswordHash:     string(adminPass),
+		IsAdmin:          true,
+		CurrentPoints:    0,
+		TotalSpentAmount: 0,
+		MemberRank:       "Normal",
 	}
 	users[admin.ID] = admin
 	usersByName[admin.Username] = admin
@@ -635,6 +668,120 @@ func getRecommendations(userID int) []RecommendedProduct {
 	return recommendations
 }
 
+// 会員ランク判定ヘルパー関数
+func calculateMemberRank(totalSpent int) string {
+	if totalSpent >= 100000 {
+		return "Gold"
+	} else if totalSpent >= 50000 {
+		return "Silver"
+	} else {
+		return "Normal"
+	}
+}
+
+// ランクによる割引率を取得
+func getRankDiscountRate(rank string) float64 {
+	switch rank {
+	case "Gold":
+		return 0.05 // 5% OFF
+	case "Silver":
+		return 0.03 // 3% OFF
+	default:
+		return 0.0
+	}
+}
+
+// ユーザーの累計購入金額を更新してランクを再計算
+func updateUserPurchaseAmountAndRank(userID int, amount int) {
+	userMux.Lock()
+	defer userMux.Unlock()
+
+	if user, exists := users[userID]; exists {
+		user.TotalSpentAmount += amount
+		newRank := calculateMemberRank(user.TotalSpentAmount)
+		user.MemberRank = newRank
+	}
+}
+
+// ポイントの付与
+func addPoints(userID int, orderID int, points int) {
+	userMux.Lock()
+	defer userMux.Unlock()
+
+	if user, exists := users[userID]; exists {
+		user.CurrentPoints += points
+
+		// ポイント履歴を記録
+		pointHistoryMux.Lock()
+		history := &PointHistory{
+			ID:        nextPointHistoryID,
+			UserID:    userID,
+			OrderID:   orderID,
+			Type:      "earned",
+			Amount:    points,
+			Balance:   user.CurrentPoints,
+			CreatedAt: time.Now(),
+		}
+		pointHistories[nextPointHistoryID] = history
+		nextPointHistoryID++
+		pointHistoryMux.Unlock()
+	}
+}
+
+// ポイントの使用
+func usePoints(userID int, orderID int, points int) bool {
+	userMux.Lock()
+	defer userMux.Unlock()
+
+	if user, exists := users[userID]; exists {
+		if user.CurrentPoints >= points {
+			user.CurrentPoints -= points
+
+			// ポイント履歴を記録
+			pointHistoryMux.Lock()
+			history := &PointHistory{
+				ID:        nextPointHistoryID,
+				UserID:    userID,
+				OrderID:   orderID,
+				Type:      "used",
+				Amount:    points,
+				Balance:   user.CurrentPoints,
+				CreatedAt: time.Now(),
+			}
+			pointHistories[nextPointHistoryID] = history
+			nextPointHistoryID++
+			pointHistoryMux.Unlock()
+			return true
+		}
+	}
+	return false
+}
+
+// ポイント使用のロールバック
+func rollbackPoints(userID int, orderID int, points int) {
+	userMux.Lock()
+	defer userMux.Unlock()
+
+	if user, exists := users[userID]; exists {
+		user.CurrentPoints += points
+
+		// ロールバック履歴を記録（キャンセルとして）
+		pointHistoryMux.Lock()
+		history := &PointHistory{
+			ID:        nextPointHistoryID,
+			UserID:    userID,
+			OrderID:   orderID,
+			Type:      "rollback",
+			Amount:    points,
+			Balance:   user.CurrentPoints,
+			CreatedAt: time.Now(),
+		}
+		pointHistories[nextPointHistoryID] = history
+		nextPointHistoryID++
+		pointHistoryMux.Unlock()
+	}
+}
+
 // ハンドラー関数
 
 // 商品一覧取得（カテゴリフィルタ対応）
@@ -844,10 +991,13 @@ func registerHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	user := &User{
-		ID:           nextUserID,
-		Username:     req.Username,
-		PasswordHash: string(hash),
-		IsAdmin:      false,
+		ID:               nextUserID,
+		Username:         req.Username,
+		PasswordHash:     string(hash),
+		IsAdmin:          false,
+		CurrentPoints:    0,
+		TotalSpentAmount: 0,
+		MemberRank:       "Normal",
 	}
 
 	nextUserID++
@@ -924,6 +1074,7 @@ func createOrderHandler(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Items      []OrderItem `json:"items"`
 		CouponCode string      `json:"coupon_code,omitempty"`
+		UsePoints  int         `json:"use_points,omitempty"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -933,6 +1084,22 @@ func createOrderHandler(w http.ResponseWriter, r *http.Request) {
 
 	if len(req.Items) == 0 {
 		errorResponse(w, http.StatusBadRequest, "No items in order")
+		return
+	}
+
+	// ポイント使用のバリデーション
+	if req.UsePoints < 0 {
+		errorResponse(w, http.StatusBadRequest, "Invalid use_points value")
+		return
+	}
+
+	userMux.RLock()
+	currentUserPoints := user.CurrentPoints
+	currentUserRank := user.MemberRank
+	userMux.RUnlock()
+
+	if req.UsePoints > currentUserPoints {
+		errorResponse(w, http.StatusBadRequest, fmt.Sprintf("Insufficient points. Available: %d, Requested: %d", currentUserPoints, req.UsePoints))
 		return
 	}
 
@@ -949,12 +1116,12 @@ func createOrderHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 在庫チェックと合計金額計算（税抜）
+	// 在庫チェックと基本価格計算
 	subtotal := 0
 	orderProducts := make([]*Product, len(req.Items))
 	stockAllocations := make(map[int]map[int]int) // productID -> warehouseID -> quantity
 
-	// 商品の存在確認と価格計算
+	// 商品の存在確認と基本価格計算
 	productMux.RLock()
 	for i, item := range req.Items {
 		if item.Quantity <= 0 {
@@ -986,28 +1153,52 @@ func createOrderHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	productMux.RUnlock()
 
-	// 支払い金額の算出アルゴリズム（仕様書の順序に従う）
-	// 1. 商品小計（既に計算済み: subtotal）
+	// 支払い金額の算出アルゴリズム（MT-8仕様書の順序に従う）
+	// 1. 商品小計の算出（会員ランク割引を適用）
+	rankDiscountRate := getRankDiscountRate(currentUserRank)
+	rankDiscountAmount := int(float64(subtotal) * rankDiscountRate)
+	discountedSubtotal := subtotal - rankDiscountAmount
 
-	// 2. 消費税の加算（10%）
-	tax := subtotal / 10
-	subtotalWithTax := subtotal + tax
+	// 2. 消費税の加算（ランク割引後の小計に対し10%）
+	tax := discountedSubtotal / 10
+	subtotalWithTax := discountedSubtotal + tax
 
-	// 3. 送料の確定（消費税加算後の金額に基づく）
+	// 3. 送料の確定
 	shippingFee := 0
-	if subtotalWithTax < 5000 {
-		shippingFee = 500
+	if currentUserRank != "Gold" { // ゴールド会員は常に送料無料
+		if subtotalWithTax < 5000 {
+			shippingFee = 500
+		}
 	}
 
 	// 4. クーポン割引の適用（商品代金＋消費税に対して、送料は対象外）
-	discountAmount := calculateCouponDiscount(appliedCoupon, subtotalWithTax)
-	discountedAmount := subtotalWithTax - discountAmount
+	couponDiscountAmount := calculateCouponDiscount(appliedCoupon, subtotalWithTax)
+	afterCouponAmount := subtotalWithTax - couponDiscountAmount
 
-	// 5. 最終金額の確定（割引後金額＋送料）
-	totalPrice := discountedAmount + shippingFee
+	// 5. ポイント利用（最後に差し引く）
+	afterPointsAmount := afterCouponAmount + shippingFee - req.UsePoints
+	if afterPointsAmount < 0 {
+		afterPointsAmount = 0
+	}
+
+	// 最終金額
+	totalPrice := afterPointsAmount
 
 	// 注文IDを先に生成（決済処理で必要）
 	orderID := nextOrderID
+
+	// ポイント付与の計算（最終支払額の1%、小数点以下切り捨て）
+	earnedPoints := totalPrice / 100
+
+	// ポイントを使用（決済前に仮で減算）
+	pointsUsed := false
+	if req.UsePoints > 0 {
+		pointsUsed = usePoints(user.ID, orderID, req.UsePoints)
+		if !pointsUsed {
+			errorResponse(w, http.StatusInternalServerError, "Failed to use points")
+			return
+		}
+	}
 
 	// 決済処理を実行（在庫減算前）
 	paymentResult := paymentGateway.ProcessPayment(totalPrice, orderID)
@@ -1019,9 +1210,12 @@ func createOrderHandler(w http.ResponseWriter, r *http.Request) {
 		Items:          req.Items,
 		TotalPrice:     totalPrice,
 		ShippingFee:    shippingFee,
-		DiscountAmount: discountAmount,
+		DiscountAmount: couponDiscountAmount,
 		AppliedCoupon:  req.CouponCode,
 		CreatedAt:      time.Now(),
+		EarnedPoints:   earnedPoints,
+		UsedPoints:     req.UsePoints,
+		RankDiscount:   rankDiscountAmount,
 	}
 
 	if paymentResult.Success {
@@ -1038,6 +1232,10 @@ func createOrderHandler(w http.ResponseWriter, r *http.Request) {
 
 		if !allAllocated {
 			// 在庫割り当て失敗（競合状態などで発生する可能性あり）
+			// ポイントをロールバック
+			if pointsUsed {
+				rollbackPoints(user.ID, orderID, req.UsePoints)
+			}
 			order.Status = "payment_failed"
 			orderMux.Lock()
 			nextOrderID++
@@ -1049,24 +1247,48 @@ func createOrderHandler(w http.ResponseWriter, r *http.Request) {
 
 		order.Status = "completed"
 
+		// ポイントを付与
+		if earnedPoints > 0 {
+			addPoints(user.ID, orderID, earnedPoints)
+		}
+
+		// ユーザーの累計購入金額とランクを更新
+		updateUserPurchaseAmountAndRank(user.ID, totalPrice)
+
+		// 更新後のユーザー情報を取得
+		userMux.RLock()
+		updatedUser := users[user.ID]
+		newTotalPoints := updatedUser.CurrentPoints
+		newRank := updatedUser.MemberRank
+		userMux.RUnlock()
+
 		// 注文を保存
 		orderMux.Lock()
 		nextOrderID++
 		orders[order.ID] = order
 		orderMux.Unlock()
 
-		// 成功レスポンスにトランザクションIDを含める
+		// 成功レスポンスにトランザクションIDとポイント情報を含める
 		response := struct {
 			*Order
-			TransactionID string `json:"transaction_id"`
+			TransactionID    string `json:"transaction_id"`
+			NewTotalPoints   int    `json:"new_total_points"`
+			CurrentRank      string `json:"current_rank"`
 		}{
-			Order:         order,
-			TransactionID: paymentResult.TransactionID,
+			Order:            order,
+			TransactionID:    paymentResult.TransactionID,
+			NewTotalPoints:   newTotalPoints,
+			CurrentRank:      newRank,
 		}
 
 		jsonResponse(w, http.StatusCreated, response)
 	} else {
 		// 決済失敗時は在庫を減らさない
+		// ポイントの使用もロールバック
+		if pointsUsed {
+			rollbackPoints(user.ID, orderID, req.UsePoints)
+		}
+
 		order.Status = "payment_failed"
 
 		// 失敗した注文も記録（監査目的）
@@ -1238,6 +1460,33 @@ func getRecommendationsHandler(w http.ResponseWriter, r *http.Request) {
 	jsonResponse(w, http.StatusOK, recommendations)
 }
 
+// ユーザー情報取得ハンドラー
+func getUserInfoHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		errorResponse(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+
+	// 認証確認
+	user := getAuthUser(r)
+	if user == nil {
+		errorResponse(w, http.StatusUnauthorized, "Unauthorized")
+		return
+	}
+
+	// ユーザー情報をレスポンス用構造体に変換
+	response := UserInfoResponse{
+		ID:               user.ID,
+		Username:         user.Username,
+		IsAdmin:          user.IsAdmin,
+		Rank:             user.MemberRank,
+		TotalSpentAmount: user.TotalSpentAmount,
+		CurrentPoints:    user.CurrentPoints,
+	}
+
+	jsonResponse(w, http.StatusOK, response)
+}
+
 // メインハンドラー
 func mainHandler(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
@@ -1266,6 +1515,8 @@ func mainHandler(w http.ResponseWriter, r *http.Request) {
 		removeFromWishlistHandler(w, r)
 	case path == "/users/me/recommendations" && r.Method == "GET":
 		getRecommendationsHandler(w, r)
+	case path == "/users/me" && r.Method == "GET":
+		getUserInfoHandler(w, r)
 	default:
 		errorResponse(w, http.StatusNotFound, "Not found")
 	}
@@ -1287,6 +1538,7 @@ func main() {
 	fmt.Println("  POST   /wishlist/{product_id}     - Add product to wishlist (auth required)")
 	fmt.Println("  DELETE /wishlist/{product_id}     - Remove product from wishlist (auth required)")
 	fmt.Println("  GET    /users/me/recommendations  - Get personalized recommendations (auth required)")
+	fmt.Println("  GET    /users/me                  - Get user info with rank and points (auth required)")
 	fmt.Println("\nDefault admin credentials: username=admin, password=admin123")
 
 	http.HandleFunc("/", mainHandler)

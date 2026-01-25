@@ -274,8 +274,18 @@ func TestCreateOrderHandler(t *testing.T) {
 	defer func() { paymentGateway = originalGateway }()
 
 	// テスト用ユーザーとトークンを設定
-	testUser := &User{ID: 3, Username: "orderuser", IsAdmin: false}
+	testUser := &User{
+		ID:               3,
+		Username:         "orderuser",
+		IsAdmin:          false,
+		CurrentPoints:    0,
+		TotalSpentAmount: 0,
+		MemberRank:       "Normal",
+	}
 	userToken := "order-test-token"
+	userMux.Lock()
+	users[testUser.ID] = testUser
+	userMux.Unlock()
 	sessionMux.Lock()
 	sessions[userToken] = testUser
 	sessionMux.Unlock()
@@ -471,8 +481,18 @@ func TestCreateOrderHandler(t *testing.T) {
 
 func TestGetOrdersHandler(t *testing.T) {
 	// テスト用ユーザーとトークンを設定
-	testUser := &User{ID: 4, Username: "orderlistuser", IsAdmin: false}
+	testUser := &User{
+		ID:               4,
+		Username:         "orderlistuser",
+		IsAdmin:          false,
+		CurrentPoints:    0,
+		TotalSpentAmount: 0,
+		MemberRank:       "Normal",
+	}
 	userToken := "orderlist-test-token"
+	userMux.Lock()
+	users[testUser.ID] = testUser
+	userMux.Unlock()
 	sessionMux.Lock()
 	sessions[userToken] = testUser
 	sessionMux.Unlock()
@@ -529,8 +549,18 @@ func TestGenerateToken(t *testing.T) {
 
 func TestGetAuthUser(t *testing.T) {
 	// テストユーザーとトークンを設定
-	testUser := &User{ID: 5, Username: "authtest", IsAdmin: false}
+	testUser := &User{
+		ID:               5,
+		Username:         "authtest",
+		IsAdmin:          false,
+		CurrentPoints:    0,
+		TotalSpentAmount: 0,
+		MemberRank:       "Normal",
+	}
 	testToken := "auth-test-token"
+	userMux.Lock()
+	users[testUser.ID] = testUser
+	userMux.Unlock()
 	sessionMux.Lock()
 	sessions[testToken] = testUser
 	sessionMux.Unlock()
@@ -643,8 +673,18 @@ func TestCreateOrderWithCoupon(t *testing.T) {
 	paymentGateway = &MockPaymentGateway{shouldSucceed: true}
 
 	// テスト用ユーザーとトークンを設定
-	testUser := &User{ID: 10, Username: "couponuser", IsAdmin: false}
+	testUser := &User{
+		ID:               10,
+		Username:         "couponuser",
+		IsAdmin:          false,
+		CurrentPoints:    0,
+		TotalSpentAmount: 0,
+		MemberRank:       "Normal",
+	}
 	userToken := "coupon-test-token"
+	userMux.Lock()
+	users[testUser.ID] = testUser
+	userMux.Unlock()
 	sessionMux.Lock()
 	sessions[userToken] = testUser
 	sessionMux.Unlock()
@@ -1366,4 +1406,352 @@ func TestMainHandler(t *testing.T) {
 	if w.Code != http.StatusNotFound {
 		t.Errorf("Expected status %d for unsupported method, got %d", http.StatusNotFound, w.Code)
 	}
+}
+
+// ランク判定のテスト
+func TestCalculateMemberRank(t *testing.T) {
+	tests := []struct {
+		name         string
+		totalSpent   int
+		expectedRank string
+	}{
+		{"Normal rank - 0円", 0, "Normal"},
+		{"Normal rank - 49,999円", 49999, "Normal"},
+		{"Silver rank - 50,000円", 50000, "Silver"},
+		{"Silver rank - 99,999円", 99999, "Silver"},
+		{"Gold rank - 100,000円", 100000, "Gold"},
+		{"Gold rank - 150,000円", 150000, "Gold"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rank := calculateMemberRank(tt.totalSpent)
+			if rank != tt.expectedRank {
+				t.Errorf("calculateMemberRank(%d) = %s; want %s", tt.totalSpent, rank, tt.expectedRank)
+			}
+		})
+	}
+}
+
+// ランク割引率のテスト
+func TestGetRankDiscountRate(t *testing.T) {
+	tests := []struct {
+		rank         string
+		expectedRate float64
+	}{
+		{"Normal", 0.0},
+		{"Silver", 0.03},
+		{"Gold", 0.05},
+		{"Unknown", 0.0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.rank, func(t *testing.T) {
+			rate := getRankDiscountRate(tt.rank)
+			if rate != tt.expectedRate {
+				t.Errorf("getRankDiscountRate(%s) = %f; want %f", tt.rank, rate, tt.expectedRate)
+			}
+		})
+	}
+}
+
+// ポイントプログラムと会員ランクの統合テスト
+func TestPointsAndRankSystem(t *testing.T) {
+	// 元の決済ゲートウェイを保存して後で復元
+	originalGateway := paymentGateway
+	defer func() { paymentGateway = originalGateway }()
+
+	// 決済成功のモックを設定
+	paymentGateway = &MockPaymentGateway{shouldSucceed: true}
+
+	// テスト用ユーザーとトークンを設定
+	testUser := &User{
+		ID:               60,
+		Username:         "pointtestuser",
+		IsAdmin:          false,
+		CurrentPoints:    500, // 初期ポイント500
+		TotalSpentAmount: 0,
+		MemberRank:       "Normal",
+	}
+	userToken := "point-test-token"
+	userMux.Lock()
+	users[testUser.ID] = testUser
+	usersByName[testUser.Username] = testUser
+	userMux.Unlock()
+	sessionMux.Lock()
+	sessions[userToken] = testUser
+	sessionMux.Unlock()
+
+	// テスト用商品を追加
+	productMux.Lock()
+	products[600] = &Product{ID: 600, Name: "ポイントテスト商品A", Price: 10000, Category: "ポイントテスト"}
+	products[601] = &Product{ID: 601, Name: "ポイントテスト商品B", Price: 50000, Category: "ポイントテスト"}
+	productMux.Unlock()
+
+	// テスト用在庫を追加
+	stockMux.Lock()
+	stocks["600-1"] = &Stock{ProductID: 600, WarehouseID: 1, Quantity: 100}
+	stocks["601-1"] = &Stock{ProductID: 601, WarehouseID: 1, Quantity: 100}
+	stockMux.Unlock()
+
+	// 1. Normal会員として購入（ポイント利用あり）
+	t.Run("NormalMemberWithPointsUsage", func(t *testing.T) {
+		reqBody := `{"items": [{"product_id": 600, "quantity": 1}], "use_points": 200}`
+		req := httptest.NewRequest("POST", "/orders", bytes.NewBufferString(reqBody))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+userToken)
+		w := httptest.NewRecorder()
+		createOrderHandler(w, req)
+
+		if w.Code != http.StatusCreated {
+			t.Errorf("Expected status %d, got %d", http.StatusCreated, w.Code)
+		}
+
+		var response struct {
+			TotalPrice       int    `json:"total_price"`
+			EarnedPoints     int    `json:"earned_points"`
+			UsedPoints       int    `json:"used_points"`
+			RankDiscount     int    `json:"rank_discount"`
+			NewTotalPoints   int    `json:"new_total_points"`
+			CurrentRank      string `json:"current_rank"`
+		}
+		json.NewDecoder(w.Body).Decode(&response)
+
+		// Normal会員: 10000円 + 消費税1000円 - ポイント200 = 10800円
+		expectedTotal := 10800
+		if response.TotalPrice != expectedTotal {
+			t.Errorf("Expected total %d, got %d", expectedTotal, response.TotalPrice)
+		}
+
+		// ポイント: 10800円の1% = 108ポイント獲得
+		if response.EarnedPoints != 108 {
+			t.Errorf("Expected earned points 108, got %d", response.EarnedPoints)
+		}
+
+		// ポイント残高: 500 - 200（使用）+ 108（獲得）= 408
+		if response.NewTotalPoints != 408 {
+			t.Errorf("Expected new total points 408, got %d", response.NewTotalPoints)
+		}
+
+		// ランクはまだNormal
+		if response.CurrentRank != "Normal" {
+			t.Errorf("Expected rank Normal, got %s", response.CurrentRank)
+		}
+	})
+
+	// 2. 大きな購入でSilver会員に昇格
+	t.Run("UpgradeToSilver", func(t *testing.T) {
+		reqBody := `{"items": [{"product_id": 601, "quantity": 1}]}`
+		req := httptest.NewRequest("POST", "/orders", bytes.NewBufferString(reqBody))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+userToken)
+		w := httptest.NewRecorder()
+		createOrderHandler(w, req)
+
+		if w.Code != http.StatusCreated {
+			t.Errorf("Expected status %d, got %d", http.StatusCreated, w.Code)
+		}
+
+		var response struct {
+			TotalPrice       int    `json:"total_price"`
+			EarnedPoints     int    `json:"earned_points"`
+			CurrentRank      string `json:"current_rank"`
+			NewTotalPoints   int    `json:"new_total_points"`
+		}
+		json.NewDecoder(w.Body).Decode(&response)
+
+		// Normal会員として購入（まだランク割引なし）: 50000円 + 消費税5000円 = 55000円
+		expectedTotal := 55000
+		if response.TotalPrice != expectedTotal {
+			t.Errorf("Expected total %d, got %d", expectedTotal, response.TotalPrice)
+		}
+
+		// 累計購入額が10800 + 55000 = 65800円となり、Silver会員に昇格
+		if response.CurrentRank != "Silver" {
+			t.Errorf("Expected rank Silver after spending 65800円, got %s", response.CurrentRank)
+		}
+
+		// ポイント獲得: 55000円の1% = 550ポイント
+		if response.EarnedPoints != 550 {
+			t.Errorf("Expected earned points 550, got %d", response.EarnedPoints)
+		}
+	})
+
+	// 3. Silver会員として購入（ランク割引あり）
+	t.Run("SilverMemberDiscount", func(t *testing.T) {
+		reqBody := `{"items": [{"product_id": 600, "quantity": 1}]}`
+		req := httptest.NewRequest("POST", "/orders", bytes.NewBufferString(reqBody))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+userToken)
+		w := httptest.NewRecorder()
+		createOrderHandler(w, req)
+
+		if w.Code != http.StatusCreated {
+			t.Errorf("Expected status %d, got %d", http.StatusCreated, w.Code)
+		}
+
+		var response struct {
+			TotalPrice   int `json:"total_price"`
+			RankDiscount int `json:"rank_discount"`
+			ShippingFee  int `json:"shipping_fee"`
+		}
+		json.NewDecoder(w.Body).Decode(&response)
+
+		// Silver会員: 10000円 * 3%割引 = 300円割引
+		if response.RankDiscount != 300 {
+			t.Errorf("Expected rank discount 300, got %d", response.RankDiscount)
+		}
+
+		// 10000 - 300（ランク割引）= 9700円、消費税970円 = 10670円（送料無料：5000円以上）
+		expectedTotal := 10670
+		if response.TotalPrice != expectedTotal {
+			t.Errorf("Expected total %d for Silver member, got %d", expectedTotal, response.TotalPrice)
+		}
+	})
+}
+
+// ユーザー情報APIのテスト
+func TestGetUserInfoHandler(t *testing.T) {
+	// テスト用ユーザーを設定
+	testUser := &User{
+		ID:               70,
+		Username:         "infotestuser",
+		IsAdmin:          false,
+		CurrentPoints:    1500,
+		TotalSpentAmount: 75000,
+		MemberRank:       "Silver",
+	}
+	userToken := "info-test-token"
+	userMux.Lock()
+	users[testUser.ID] = testUser
+	usersByName[testUser.Username] = testUser
+	userMux.Unlock()
+	sessionMux.Lock()
+	sessions[userToken] = testUser
+	sessionMux.Unlock()
+
+	// ユーザー情報取得のテスト
+	t.Run("GetUserInfo", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/users/me", nil)
+		req.Header.Set("Authorization", "Bearer "+userToken)
+		w := httptest.NewRecorder()
+		getUserInfoHandler(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Errorf("Expected status %d, got %d", http.StatusOK, w.Code)
+		}
+
+		var response UserInfoResponse
+		json.NewDecoder(w.Body).Decode(&response)
+
+		if response.ID != testUser.ID {
+			t.Errorf("Expected ID %d, got %d", testUser.ID, response.ID)
+		}
+		if response.Username != testUser.Username {
+			t.Errorf("Expected username %s, got %s", testUser.Username, response.Username)
+		}
+		if response.Rank != "Silver" {
+			t.Errorf("Expected rank Silver, got %s", response.Rank)
+		}
+		if response.TotalSpentAmount != 75000 {
+			t.Errorf("Expected total spent 75000, got %d", response.TotalSpentAmount)
+		}
+		if response.CurrentPoints != 1500 {
+			t.Errorf("Expected points 1500, got %d", response.CurrentPoints)
+		}
+	})
+
+	// 認証なしでのアクセステスト
+	t.Run("GetUserInfoWithoutAuth", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/users/me", nil)
+		w := httptest.NewRecorder()
+		getUserInfoHandler(w, req)
+
+		if w.Code != http.StatusUnauthorized {
+			t.Errorf("Expected status %d for no auth, got %d", http.StatusUnauthorized, w.Code)
+		}
+	})
+
+	// 不正なメソッドのテスト
+	t.Run("InvalidMethodForUserInfo", func(t *testing.T) {
+		req := httptest.NewRequest("POST", "/users/me", nil)
+		req.Header.Set("Authorization", "Bearer "+userToken)
+		w := httptest.NewRecorder()
+		getUserInfoHandler(w, req)
+
+		if w.Code != http.StatusMethodNotAllowed {
+			t.Errorf("Expected status %d for invalid method, got %d", http.StatusMethodNotAllowed, w.Code)
+		}
+	})
+}
+
+// ゴールド会員の送料無料テスト
+func TestGoldMemberFreeShipping(t *testing.T) {
+	// 元の決済ゲートウェイを保存して後で復元
+	originalGateway := paymentGateway
+	defer func() { paymentGateway = originalGateway }()
+	paymentGateway = &MockPaymentGateway{shouldSucceed: true}
+
+	// ゴールド会員のユーザーを設定
+	goldUser := &User{
+		ID:               80,
+		Username:         "golduser",
+		IsAdmin:          false,
+		CurrentPoints:    0,
+		TotalSpentAmount: 150000,
+		MemberRank:       "Gold",
+	}
+	goldToken := "gold-test-token"
+	userMux.Lock()
+	users[goldUser.ID] = goldUser
+	usersByName[goldUser.Username] = goldUser
+	userMux.Unlock()
+	sessionMux.Lock()
+	sessions[goldToken] = goldUser
+	sessionMux.Unlock()
+
+	// テスト用商品を追加
+	productMux.Lock()
+	products[700] = &Product{ID: 700, Name: "ゴールドテスト商品", Price: 1000, Category: "ゴールドテスト"}
+	productMux.Unlock()
+	stockMux.Lock()
+	stocks["700-1"] = &Stock{ProductID: 700, WarehouseID: 1, Quantity: 100}
+	stockMux.Unlock()
+
+	// ゴールド会員の購入（送料無料）
+	t.Run("GoldMemberFreeShipping", func(t *testing.T) {
+		reqBody := `{"items": [{"product_id": 700, "quantity": 1}]}`
+		req := httptest.NewRequest("POST", "/orders", bytes.NewBufferString(reqBody))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+goldToken)
+		w := httptest.NewRecorder()
+		createOrderHandler(w, req)
+
+		if w.Code != http.StatusCreated {
+			t.Errorf("Expected status %d, got %d", http.StatusCreated, w.Code)
+		}
+
+		var response struct {
+			TotalPrice   int `json:"total_price"`
+			RankDiscount int `json:"rank_discount"`
+			ShippingFee  int `json:"shipping_fee"`
+		}
+		json.NewDecoder(w.Body).Decode(&response)
+
+		// ゴールド会員: 5%割引
+		if response.RankDiscount != 50 {
+			t.Errorf("Expected rank discount 50, got %d", response.RankDiscount)
+		}
+
+		// 送料無料
+		if response.ShippingFee != 0 {
+			t.Errorf("Expected free shipping for Gold member, got %d", response.ShippingFee)
+		}
+
+		// 1000 - 50（ランク割引）= 950円、消費税95円、送料0円 = 1045円
+		expectedTotal := 1045
+		if response.TotalPrice != expectedTotal {
+			t.Errorf("Expected total %d for Gold member with free shipping, got %d", expectedTotal, response.TotalPrice)
+		}
+	})
 }
